@@ -68,6 +68,11 @@ class CorpusPermanentFailure(Exception):
         self.detail = detail
 
 
+class CorpusJobRetired(Exception):
+    """The validator answered 410 ``job_retired``: the job admits nothing more.
+    A job end, not a failure: the miner stops it without retrying."""
+
+
 class CorpusMinerHalted(Exception):
     """Raised out of ``mine_steps`` after too many consecutive permanent
     failures on one call, so the CLI can report why and exit non-zero
@@ -103,6 +108,8 @@ def issue_corpus_request(request_call):
         response = request_call()
     except httpx.TransportError as exc:
         raise CorpusTransientFailure(f"transport error: {exc}") from exc
+    if response.status_code == 410 and _error_object(response).get("detail") == "job_retired":
+        raise CorpusJobRetired(f"410 job_retired from {response.request.url}")
     if response.status_code in TRANSIENT_STATUSES:
         raise CorpusTransientFailure(f"{response.status_code} from {response.request.url}")
     if response.status_code >= 400:
@@ -132,6 +139,7 @@ class HttpCorpusClient:
     def __init__(self, http, *, job_id: str | None = None) -> None:
         self._http = http
         self._job_id = job_id
+        self.scoped_submit = False
 
     def served_jobs(self) -> list:
         """Every job the validator serves; empty when it cannot say."""
@@ -179,7 +187,18 @@ class HttpCorpusClient:
         return int(issue_corpus_request(lambda: self._http.get(path))["cursor"])
 
     def submit(self, body: dict) -> dict:
-        return issue_corpus_request(lambda: self._http.post("/corpus/submit", json=body))
+        # An eval job is served behind its own prefix only (the eval control):
+        # set by the caller once the job's manifest names an eval set.
+        path = (f"/corpus/jobs/{self._job_id}/submit"
+                if self._job_id is not None and self.scoped_submit else "/corpus/submit")
+        return issue_corpus_request(lambda: self._http.post(path, json=body))
+
+    def eval_prompts(self) -> bytes:
+        """An eval job's prompt lines, which the job's manifest hashes."""
+        response = self._http.get(f"/corpus/jobs/{self._job_id}/eval-prompts")
+        self._refuse_unserved(response)
+        response.raise_for_status()
+        return response.content
 
     def _path(self, tail: str) -> str:
         return (f"/corpus/{tail}" if self._job_id is None
@@ -361,6 +380,23 @@ def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
                max_steps: int | None = None, sleep=time.sleep,
                max_consecutive_failures: int = _MAX_CONSECUTIVE_FAILURES,
                sign_skip=None) -> dict[str, int]:
+    """``_mine_steps``, ended cleanly (one log line, no retry) when the
+    validator says the job is retired."""
+    counts: Counter[str] = Counter()
+    try:
+        return _mine_steps(job=job, hotkey=hotkey, client=client, generator=generator,
+                           tokenizer=tokenizer, render=render, sign=sign, max_steps=max_steps,
+                           sleep=sleep, max_consecutive_failures=max_consecutive_failures,
+                           sign_skip=sign_skip, counts=counts)
+    except CorpusJobRetired as exc:
+        counts["job_retired"] += 1
+        logger.info("corpus job %s is retired; stopping it (%s)", job.job_id, exc)
+        return dict(counts)
+
+
+def _mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
+                max_steps: int | None, sleep, max_consecutive_failures: int,
+                sign_skip, counts: Counter) -> dict[str, int]:
     """Mine up to ``max_steps`` generations.
 
     With ``sign_skip`` on a ``miner_walk`` job, each step first asks the
@@ -368,7 +404,6 @@ def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
     rather than generating for them. A validator without those routes, or one
     that cannot verify a skip, is mined exactly as before.
     """
-    counts: Counter[str] = Counter()
     retry_kwargs = dict(sleep=sleep, counts=counts, max_consecutive_failures=max_consecutive_failures)
     cursor = _retry(lambda: client.cursor(hotkey), **retry_kwargs)
     steps = 0
@@ -758,6 +793,9 @@ def mine_window(*, job, hotkey, client, generator, tokenizer, render, sign, wind
                     counts["generation_failed"] += 1
                     drop(cursor)
                     heapq.heappush(redo, cursor)
+    except CorpusJobRetired as exc:
+        counts["job_retired"] += 1
+        logger.info("corpus job %s is retired; stopping it (%s)", job.job_id, exc)
     finally:
         for cursor in list(slots):
             drop(cursor)
@@ -957,24 +995,42 @@ class VllmGenerator:
         return max(1, (self._kv[0] - 1) // (n * self._request_blocks(prompt_len)))
 
     def generate(self, prompt_ids: list[int], n: int) -> list[Generation]:
-        import base64
-
         from vllm.inputs import TokensPrompt
+
+        outputs = self._llm.generate([TokensPrompt(prompt_token_ids=prompt_ids)] * n, self._params)
+        return self._generations(outputs, [len(prompt_ids)] * n)
+
+    def generate_many(self, prompts: list[list[int]], ns: list[int]) -> list[list[Generation]]:
+        """Several prompts, ``ns[i]`` completions each, decoded in one batch
+        (qualification); grouped back per prompt."""
+        from vllm.inputs import TokensPrompt
+
+        flat = [ids for ids, n in zip(prompts, ns) for _ in range(n)]
+        outputs = self._llm.generate([TokensPrompt(prompt_token_ids=ids) for ids in flat],
+                                     self._params)
+        generations = self._generations(outputs, [len(ids) for ids in flat])
+        grouped, start = [], 0
+        for n in ns:
+            grouped.append(generations[start:start + n])
+            start += n
+        return grouped
+
+    def _generations(self, outputs, prompt_lengths: list[int]) -> list[Generation]:
+        import base64
 
         from reliquary.miner.vllm_hidden_capture import completion_rows
         from reliquary.protocol.toploc_proof import build_chunk_proofs
 
-        outputs = self._llm.generate([TokensPrompt(prompt_token_ids=prompt_ids)] * n, self._params)
         generations = []
-        for index, output in enumerate(outputs):
+        for index, (output, prompt_length) in enumerate(zip(outputs, prompt_lengths)):
             tokens = list(output.outputs[0].token_ids)
             # `pop`, not `for_request`: this generator lives for the whole
             # mining run, and a request's rows are never read again after its
             # proof is built, so keeping them would grow CPU memory unbounded.
             try:
-                total = len(prompt_ids) + len(tokens)
+                total = prompt_length + len(tokens)
                 rows = completion_rows(self._capture.pop(output.request_id, limit=total - 1),
-                                       len(prompt_ids), total)
+                                       prompt_length, total)
             except ValueError:
                 # A row-count mismatch usually means vLLM preempted and
                 # recomputed this request under KV pressure mid-batch: the

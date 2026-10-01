@@ -255,6 +255,7 @@ def build_corpus_task_entry(
     min_incentive_share=0.0,
     audit_params: Mapping | None = None,
     base=None,
+    toploc_thresholds: Mapping | None = None,
 ):
     """One registry entry for a corpus generation job.
 
@@ -302,7 +303,7 @@ def build_corpus_task_entry(
     # none unless told to.
     if audit_params:
         params.update(audit_params)
-    contract = _with_enforced_toploc(entry.contract)
+    contract = _with_enforced_toploc(entry.contract, toploc_thresholds)
     return replace(
         entry,
         mechanism=MECHANISM_CORPUS_GENERATION,
@@ -313,20 +314,25 @@ def build_corpus_task_entry(
     )
 
 
-def _with_enforced_toploc(contract):
+def _with_enforced_toploc(contract, thresholds=None):
     """A corpus task is paid only on audited work, and the corpus validator
     refuses a contract without an enforced toploc proof. No compiled template
     carries one, so the template's own toploc entry is enforced if it has one,
-    and Prime Intellect's deployed defaults are added otherwise."""
+    and Prime Intellect's deployed defaults are added otherwise. ``thresholds``
+    (a qualification's, never under the floors) replace the proof's own."""
     from reliquary.protocol.profiles import PROOF_SCHEME_TOPLOC, TOPLOC_DEPLOYED_DEFAULTS
 
     proofs = [dict(p) for p in contract.get("proofs") or ()]
     toploc = [p for p in proofs if p.get("scheme") == PROOF_SCHEME_TOPLOC]
-    if toploc:
-        for proof in toploc:
-            proof["mode"] = "enforce"
-    else:
+    if not toploc:
         proofs.append(TOPLOC_DEPLOYED_DEFAULTS.to_contract())
+        toploc = [proofs[-1]]
+    for proof in toploc:
+        proof["mode"] = "enforce"
+        if thresholds:
+            from reliquary.eval.qualification import check_thresholds
+
+            proof.update(check_thresholds(dict(thresholds)))
     return {**contract, "proofs": proofs}
 
 
@@ -875,6 +881,7 @@ def build_job_manifest(
     from_profile=None,
     profile=None,
     prompt_start=0,
+    seed=None,
 ):
     """The manifest as the job store will hold it, refused unless every
     submission it will ever be paid for could be admitted.
@@ -896,6 +903,10 @@ def build_job_manifest(
             "--grader-id and --threshold go together: a filter needs both, and "
             "a job that keeps every completion declares neither"
         )
+    from reliquary.eval.sets import refuse_held_out_overlap
+
+    # Eval sets hold some rows out; a job may never sell them.
+    refuse_held_out_overlap(prompt_source, prompt_start, prompt_count)
     manifest = {
         "schema": JOB_SCHEMA,
         "job_id": job_id,
@@ -927,6 +938,8 @@ def build_job_manifest(
         # Written only when set, so a job declared without it stores the bytes
         # it always did; a negative start is left for `parse_job` to name.
         manifest["prompt_start"] = prompt_start
+    if seed is not None:
+        manifest["seed"] = seed
     # Resolving RENDERS the source's rule and BUILDING it counts its rows, and
     # both are refusals the operator would otherwise meet one submission at a
     # time: an unrenderable source fails fidelity forever, and a range
@@ -970,6 +983,85 @@ def _corpus_base_profile(
         run=RUN_POLICIES["corpus-v1"],
         environments=[prompt_source],
     )
+
+
+def prepare_corpus_job(
+    *, job_id, task_id, model, model_revision, model_architecture, checkpoint_sha256,
+    from_profile, prompt_encoding, prompt_source, prompt_count, prompt_start, renderer_id,
+    eos_token_id, slots_per_prompt, max_new_tokens, cap, min_incentive_share, audit_params,
+    min_new_tokens=2, temperature=1.0, top_p=1.0, top_k=0, n=1, grader_id=None,
+    threshold=None, prompt_order="free", deadline_round=None, overrides=None,
+    verification=None, seed=None, contract_environment=None, toploc_thresholds=None,
+):
+    """The manifest and the registry entry `jobs create` writes, built and
+    checked without writing either (the admin service declares jobs with it).
+
+    ``contract_environment`` is the catalog environment the contract declares
+    when the prompt source is not one (an eval set: its own environment);
+    ``toploc_thresholds`` replaces the proof's thresholds (from qualification)."""
+    environment = contract_environment or prompt_source
+    base = _corpus_base_profile(
+        task_id=task_id or job_id, from_profile=from_profile, model=model,
+        model_revision=model_revision, model_architecture=model_architecture,
+        prompt_encoding=prompt_encoding, renderer_id=renderer_id,
+        prompt_source=environment,
+    )
+    if max_new_tokens is None:
+        # The template or catalog budgets each environment; the length stays
+        # a manifest field, so the contract body is not overridden.
+        environments = base.environments
+        if environment not in environments:
+            raise ValueError(
+                f"template {from_profile!r} does not declare {environment!r}; "
+                "pass --max-new-tokens"
+            )
+        max_new_tokens = environments[environment].max_new_tokens
+    manifest = build_job_manifest(
+        job_id=job_id,
+        # The contract's model IS the job's frozen checkpoint. Taking both
+        # from one flag is what makes them unable to disagree: a validator
+        # verifying one model while admitting against another job would
+        # pay for work nobody can reproduce.
+        checkpoint_repo=model,
+        checkpoint_revision=model_revision,
+        checkpoint_sha256=checkpoint_sha256,
+        prompt_source=prompt_source,
+        prompt_count=prompt_count,
+        prompt_start=prompt_start,
+        renderer_id=renderer_id,
+        # The profile the entry's contract is built from, so the manifest is
+        # checked against the contract this command declares.
+        profile=base,
+        eos_token_id=eos_token_id,
+        slots_per_prompt=slots_per_prompt,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        min_new_tokens=min_new_tokens,
+        max_new_tokens=max_new_tokens,
+        n=n,
+        grader_id=grader_id,
+        threshold=threshold,
+        prompt_order=prompt_order,
+        deadline_round=deadline_round,
+        seed=seed,
+    )
+    entry = build_corpus_task_entry(
+        task_id=task_id or job_id,
+        job_id=job_id,
+        base=base,
+        model_id=model,
+        model_revision=model_revision,
+        model_architecture=model_architecture,
+        prompt_source=environment,
+        cap=cap,
+        overrides=dict(overrides or {}),
+        verification=verification,
+        min_incentive_share=min_incentive_share,
+        audit_params=dict(audit_params),
+        toploc_thresholds=toploc_thresholds,
+    )
+    return manifest, entry
 
 
 @jobs_app.command("create")
@@ -1128,62 +1220,13 @@ def jobs_create(
         k: v for k, v in (("start", start), ("decay", decay)) if v is not None
     }
     try:
-        base = _corpus_base_profile(
-            task_id=task_id or job_id, from_profile=from_profile, model=model,
-            model_revision=model_revision, model_architecture=model_architecture,
-            prompt_encoding=prompt_encoding, renderer_id=renderer_id,
-            prompt_source=prompt_source,
-        )
-        if max_new_tokens is None:
-            # The template or catalog budgets each environment; the length stays
-            # a manifest field, so the contract body is not overridden.
-            environments = base.environments
-            if prompt_source not in environments:
-                raise ValueError(
-                    f"template {from_profile!r} does not declare {prompt_source!r}; "
-                    "pass --max-new-tokens"
-                )
-            max_new_tokens = environments[prompt_source].max_new_tokens
-        manifest = build_job_manifest(
-            job_id=job_id,
-            # The contract's model IS the job's frozen checkpoint. Taking both
-            # from one flag is what makes them unable to disagree: a validator
-            # verifying one model while admitting against another job would
-            # pay for work nobody can reproduce.
-            checkpoint_repo=model,
-            checkpoint_revision=model_revision,
-            checkpoint_sha256=checkpoint_sha256,
-            prompt_source=prompt_source,
-            prompt_count=prompt_count,
-            prompt_start=prompt_start,
-            renderer_id=renderer_id,
-            # The profile the entry's contract is built from, so the manifest is
-            # checked against the contract this command declares.
-            profile=base,
-            eos_token_id=eos_token_id,
-            slots_per_prompt=slots_per_prompt,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_new_tokens=min_new_tokens,
-            max_new_tokens=max_new_tokens,
-            n=n,
-            grader_id=grader_id,
-            threshold=threshold,
-            prompt_order=prompt_order,
-            deadline_round=deadline_round,
-        )
-        entry = build_corpus_task_entry(
-            task_id=task_id or job_id,
-            job_id=job_id,
-            base=base,
-            model_id=model,
-            model_revision=model_revision,
-            model_architecture=model_architecture,
-            prompt_source=prompt_source,
-            cap=cap,
-            overrides=overrides,
-            verification=verification,
+        manifest, entry = prepare_corpus_job(
+            job_id=job_id, task_id=task_id, model=model, model_revision=model_revision,
+            model_architecture=model_architecture, checkpoint_sha256=checkpoint_sha256,
+            from_profile=from_profile, prompt_encoding=prompt_encoding,
+            prompt_source=prompt_source, prompt_count=prompt_count, prompt_start=prompt_start,
+            renderer_id=renderer_id, eos_token_id=eos_token_id,
+            slots_per_prompt=slots_per_prompt, max_new_tokens=max_new_tokens, cap=cap,
             min_incentive_share=min_incentive_share,
             audit_params={
                 "audit_q": audit_q,
@@ -1194,6 +1237,9 @@ def jobs_create(
                 "audit_ban_window_seconds": audit_ban_window_seconds,
                 "audit_ban_seconds": audit_ban_seconds,
             },
+            min_new_tokens=min_new_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
+            n=n, grader_id=grader_id, threshold=threshold, prompt_order=prompt_order,
+            deadline_round=deadline_round, overrides=overrides, verification=verification,
         )
     except (RegistryError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -1295,31 +1341,14 @@ def jobs_list() -> None:
 
 
 def _job_grader(job):
-    """The grader `--apply-filter` scores every completion with: the job's own
-    prompt source, at its own filter's threshold. Episode-mode sources cannot
-    grade a single completion text this way (there is no single-turn
-    `get_problem`/`compute_reward` for them), so this refuses instead of
-    grading wrongly."""
-    from reliquary.environment.registry import ENVIRONMENT_SPECS
-    from reliquary.validator.corpus_service import _owned_position
+    """The grader `--apply-filter` scores every completion with (`job_grader`),
+    refused as a bad parameter rather than graded wrongly."""
+    from reliquary.corpus.export import job_grader
 
-    if job.filter is None:
-        raise typer.BadParameter(f"job {job.job_id!r} has no filter to apply")
-    spec = ENVIRONMENT_SPECS[job.prompt_source]
-    if spec.interaction_mode == "episode":
-        raise typer.BadParameter(
-            f"prompt source {job.prompt_source!r} is episode-mode; "
-            "--apply-filter cannot grade a single completion text against it"
-        )
-    environment = spec.create()
-    threshold = job.filter.threshold
-
-    def grade(prompt_index: int, text: str) -> tuple[bool, float]:
-        problem = environment.get_problem(_owned_position(job, prompt_index))
-        reward = environment.compute_reward(problem, text)
-        return reward >= threshold, reward
-
-    return grade
+    try:
+        return job_grader(job)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 @jobs_app.command("export")
@@ -1379,28 +1408,18 @@ def jobs_status(job_id: str = typer.Argument(...)) -> None:
     audited or settled when the corpus validator stops is never paid.
     """
     from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+    from reliquary.validator.corpus_job_status import stored_job_counts
 
-    async def _read():
-        records = BucketRecordStore()
-        submissions = set(await records.list_submission_ids(job_id))
-        verdicts = set(await records.list_verdict_ids(job_id))
-        state, _ = await records.read_settlement(job_id)
-        return submissions, verdicts, state or {}
-
-    submissions, verdicts, state = asyncio.run(_read())
-    settled = verdicts & set(state.get("settled") or ())
-    pending = state.get("pending")
-    pending_window = pending["window"] if pending else None
-    last_window = state.get("last_window")
-    unaudited = len(submissions - verdicts)
-    unsettled = len(verdicts - settled)
+    counts = asyncio.run(stored_job_counts(BucketRecordStore(), job_id))
+    pending_window, last_window = counts["pending_window"], counts["last_window"]
     typer.echo(
-        f"{job_id}: submissions={len(submissions)} verdicts={len(verdicts)} "
-        f"unaudited={unaudited} settled={len(settled)} unsettled={unsettled} "
+        f"{job_id}: submissions={counts['submissions']} verdicts={counts['verdicts']} "
+        f"unaudited={counts['unaudited']} settled={counts['settled']} "
+        f"unsettled={counts['unsettled']} "
         f"pending={'none' if pending_window is None else pending_window} "
         f"last_window={'none' if last_window is None else last_window}"
     )
-    drained = unaudited == 0 and unsettled == 0 and pending is None
+    drained = counts["drained"]
     typer.echo(f"drained: {'yes' if drained else 'no'}")
 
 
@@ -1508,6 +1527,137 @@ def jobs_cancel(
     )
 
 
+admin_app = typer.Typer(name="admin", help="The subnet admin service the platform calls")
+app.add_typer(admin_app)
+
+
+def build_admin_app_from_environment():
+    """The admin app as `admin serve` runs it, configured from the environment.
+
+    ``RELIQUARY_ADMIN_SECRET``, ``RELIQUARY_ADMIN_POOL_MAX`` and
+    ``RELIQUARY_ADMIN_MODELS`` (a JSON file of qualified models) are required;
+    ``RELIQUARY_ADMIN_TASK_PREFIX`` (default ``order-``) bounds the task and job
+    ids the platform may touch; deliveries and evaluation grading need
+    ``RELIQUARY_PLATFORM_BUCKET`` and its scoped ``RELIQUARY_PLATFORM_R2_*``
+    credentials, and are off without them. Eval sets' grading files are read
+    from the subnet bucket (``R2_*``).
+    """
+    import json
+
+    from reliquary.admin.service import create_admin_app
+
+    secret = os.getenv("RELIQUARY_ADMIN_SECRET", "")
+    if len(secret) < 32:
+        raise ValueError("RELIQUARY_ADMIN_SECRET must be set, at least 32 characters")
+    pool = os.getenv("RELIQUARY_ADMIN_POOL_MAX", "").strip()
+    if not pool:
+        raise ValueError("RELIQUARY_ADMIN_POOL_MAX must be set: the corpus caps' total budget")
+    models_path = os.getenv("RELIQUARY_ADMIN_MODELS", "").strip()
+    if not models_path:
+        raise ValueError("RELIQUARY_ADMIN_MODELS must name the qualified models JSON file")
+    with open(models_path, encoding="utf-8") as handle:
+        models = json.load(handle)
+    deliveries = None
+    if os.getenv("RELIQUARY_PLATFORM_BUCKET", "").strip():
+        from reliquary.corpus.delivery import R2DeliverySink
+
+        deliveries = R2DeliverySink.from_environment()
+    prefix = os.getenv("RELIQUARY_ADMIN_TASK_PREFIX", "order-")
+    return create_admin_app(secret=secret.encode(), pool_max=float(pool), models=models,
+                            deliveries=deliveries, task_prefix=prefix,
+                            work_dir=os.getenv("RELIQUARY_ADMIN_WORK_DIR") or None)
+
+
+@admin_app.command("serve")
+def admin_serve(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8790, "--port"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+) -> None:
+    """Serve the signed admin routes: jobs, caps, retirement, executors, deliveries."""
+    import uvicorn
+
+    setup_logging(log_level)
+    try:
+        admin = build_admin_app_from_environment()
+    except (ValueError, OSError, RuntimeError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    uvicorn.run(admin, host=host, port=port, log_level=log_level.lower())
+
+
+eval_app = typer.Typer(name="eval", help="Evaluation orders: frozen sets and the pod runner")
+app.add_typer(eval_app)
+
+
+@eval_app.command("build-set")
+def eval_build_set(
+    env: str = typer.Option(..., "--env", help="math, code, logic or instruction_following"),
+    count: int = typer.Option(..., "--count", min=1),
+    seed: int = typer.Option(..., "--seed"),
+    out: str = typer.Option(..., "--out", help="An empty directory for the three files"),
+    set_id: str | None = typer.Option(None, "--set-id"),
+) -> None:
+    """Freeze COUNT held-out problems: prompts.jsonl, grading.jsonl, set.json."""
+    import json
+
+    from reliquary.eval import sets
+
+    try:
+        card = sets.build_set(env, count=count, seed=seed, out=out, set_id=set_id,
+                              open_environment=sets.open_source)
+    except (ValueError, FileExistsError, KeyError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps({k: card[k] for k in ("set_id", "env", "source", "split", "count",
+                                                "index_range", "prompts_sha256",
+                                                "grading_sha256")}, indent=1))
+
+
+@eval_app.command("publish-set")
+def eval_publish_set(directory: str = typer.Argument(..., help="A directory build-set wrote")) -> None:
+    """Upload a set: prompts.jsonl and set.json to the platform bucket
+    (RELIQUARY_PLATFORM_*), grading.jsonl and set.json to the subnet bucket (R2_*)."""
+    import json
+
+    from reliquary.corpus.delivery import R2DeliverySink
+    from reliquary.eval.storage import SetConflict, SubnetEvalStore, publish_set
+
+    try:
+        answer = asyncio.run(publish_set(directory, platform=R2DeliverySink.from_environment(),
+                                         subnet=SubnetEvalStore()))
+    except (ValueError, OSError, RuntimeError, SetConflict) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(answer, indent=1))
+
+
+@eval_app.command("run")
+def eval_run(
+    platform: str = typer.Option(..., "--platform", help="The platform's base URL"),
+    executor_id: str = typer.Option(..., "--executor-id"),
+    work_dir: str = typer.Option("/opt/reliquary-eval", "--work-dir",
+                                 help="Chunks and resume state; keep it across restarts"),
+    chunk_problems: int = typer.Option(64, "--chunk-problems", min=1),
+    log_level: str = typer.Option("INFO", help="Log level"),
+) -> None:
+    """Claim one evaluation task and generate it with vLLM (token in
+    RELIQUARY_EXECUTOR_TOKEN)."""
+    import json
+
+    from reliquary.eval.platform_client import LeaseLost
+    from reliquary.eval.runner import run_evaluation
+
+    setup_logging(log_level)
+    try:
+        result = run_evaluation(platform=platform, executor_id=executor_id, work_dir=work_dir,
+                                chunk_problems=chunk_problems)
+    except (ValueError, LeaseLost) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(result) if result is not None else "no evaluation task to claim")
+
+
 corpus_app = typer.Typer(name="corpus", help="Mine a corpus generation task")
 app.add_typer(corpus_app)
 
@@ -1610,6 +1760,77 @@ def ledgers_downgrade(job_id: str = typer.Option(..., "--job")) -> None:
     typer.echo(f"{job_id}: {_run_on_ledgers(job_id, downgrade_ledgers_v1)}")
 
 
+@corpus_app.command("audit-executor")
+def corpus_audit_executor(
+    control: str = typer.Option(..., "--control", help="The corpus control's HTTPS origin"),
+    executor_id: str = typer.Option(..., "--executor-id"),
+    model_id: str = typer.Option(
+        None, "--model-id", help="Defaults to the model this executor is registered for"),
+    model_revision: str = typer.Option(None, "--model-revision"),
+    eval_control: bool = typer.Option(
+        False, "--eval", help="Score for the eval control (its /corpus/internal/eval-audit routes)"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+) -> None:
+    """Score corpus audit leases on this GPU. The only secret is the executor
+    token, in RELIQUARY_EXECUTOR_TOKEN; the model comes from the public HF repo."""
+    from reliquary.validator.corpus_audit_executor import (
+        EVAL_AUDIT_PREFIX, TOKEN_ENV, run_audit_executor,
+    )
+
+    setup_logging(log_level)
+    if not os.environ.get(TOKEN_ENV, "").strip():
+        typer.echo(f"error: {TOKEN_ENV} is not set", err=True)
+        raise typer.Exit(code=1)
+    # The corpus control's call is left exactly as it was.
+    route = {"prefix": EVAL_AUDIT_PREFIX} if eval_control else {}
+    run_audit_executor(control_url=control, executor_id=executor_id, model_id=model_id,
+                       model_revision=model_revision, **route)
+
+
+@corpus_app.command("eval-control")
+def corpus_eval_control(
+    netuid: int = typer.Option(81, "--netuid"),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8791, "--port"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+) -> None:
+    """Serve every eval corpus job (ids ${RELIQUARY_ADMIN_TASK_PREFIX}eval-,
+    order-eval- by default), whatever its model, with no GPU: tokenizers on
+    CPU, audits by executor pairs on distinct providers. Route
+    ^/corpus/jobs/<prefix>eval- and ^/corpus/internal/eval-audit/ here; the
+    corpus control keeps everything else."""
+    from reliquary.validator.eval_control import run_eval_control
+
+    setup_logging(log_level)
+    asyncio.run(run_eval_control(netuid=netuid, http_host=host, http_port=port))
+
+
+@corpus_app.command("qualify")
+def corpus_qualify(
+    model: str = typer.Option(..., "--model", help="repo@revision of the model to qualify"),
+    control: str = typer.Option(..., "--control", help="The eval control's HTTPS origin"),
+    executor_id: str = typer.Option(..., "--executor-id"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+) -> None:
+    """Run one qualification of MODEL leased by the eval control: decode the
+    eval prompts with vLLM, verify them with the HF prefill, post the measured
+    TOPLOC band. The token is in RELIQUARY_EXECUTOR_TOKEN."""
+    import json
+
+    from reliquary.eval.qualify_executor import run_qualify
+
+    setup_logging(log_level)
+    if not os.environ.get("RELIQUARY_EXECUTOR_TOKEN", "").strip():
+        typer.echo("error: RELIQUARY_EXECUTOR_TOKEN is not set", err=True)
+        raise typer.Exit(code=1)
+    try:
+        answer = run_qualify(control_url=control, executor_id=executor_id, model=model)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(answer))
+
+
 @corpus_app.command("mine")
 def corpus_mine(
     validator_url: str = typer.Option(..., "--validator-url"),
@@ -1707,6 +1928,19 @@ def corpus_mine(
         encoded = tokenizer.encode(text, add_special_tokens=False)
         return list(getattr(encoded, "ids", encoded))
 
+    from reliquary.eval.prompt_source import (
+        is_eval_source, parse_eval_source, register_eval_prompts,
+    )
+
+    if is_eval_source(job.prompt_source):
+        # An eval job's prompts come from the control serving it, checked
+        # against the sha256 its manifest names.
+        client.scoped_submit = True
+        try:
+            register_eval_prompts(parse_eval_source(job.prompt_source), client.eval_prompts())
+        except (ValueError, CorpusJobSelectionError) as exc:
+            typer.echo(f"error: the eval job's prompts are unusable: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
     renderer = renderer_for_job(job, encode, tokenizer=tokenizer)
     prompts = prompt_job_for_spec(job)
     generator = VllmGenerator(directory, job.sampling, proof, job.eos_token_id,
@@ -1928,6 +2162,35 @@ def _v3_activation_checkpoint_revision(
 
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _corpus_hot_registry_reader():
+    """The registry reader that makes a corpus validator's job set hot, or None.
+
+    Off unless ``RELIQUARY_CORPUS_HOT_JOBS=1``: a hot validator starts serving
+    (and paying) any active corpus entry on its model, which an operator opts into.
+    """
+    if not _env_flag("RELIQUARY_CORPUS_HOT_JOBS"):
+        return None
+    from reliquary.infrastructure.task_registry_store import read_registry
+
+    async def entries():
+        found, _ = await read_registry()
+        return found
+
+    return entries
+
+
+def _corpus_remote_audit_options() -> dict:
+    """Remote audit executors, on with ``RELIQUARY_CORPUS_REMOTE_AUDIT=1``;
+    ``RELIQUARY_CORPUS_RECHECK_FRACTION`` (default 0.05) is the share of their
+    results this GPU recomputes."""
+    if not _env_flag("RELIQUARY_CORPUS_REMOTE_AUDIT"):
+        return {}
+    fraction = float(os.getenv("RELIQUARY_CORPUS_RECHECK_FRACTION", "0.05"))
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("RELIQUARY_CORPUS_RECHECK_FRACTION must be in (0, 1]")
+    return {"remote_audit": True, "recheck_fraction": fraction}
 
 
 def _miner_requires_grader(env_names: list[str]) -> bool:
@@ -2563,9 +2826,10 @@ def validate(
                         jobs=[(c.entry, c.emission_cap) for c in corpus_configs],
                         wallet=wallet, netuid=netuid, signer_client=signer_client,
                         http_host=http_host, http_port=http_port,
-                        set_weights=set_weights,
+                        set_weights=set_weights, read_registry=_corpus_hot_registry_reader(),
+                        **_corpus_remote_audit_options(),
                     )
-                except RuntimeError as exc:
+                except (RuntimeError, ValueError) as exc:
                     logger.critical("%s; fix the declaration before starting this validator", exc)
                     raise typer.Exit(code=4) from exc
                 return
@@ -2634,9 +2898,10 @@ def validate(
                         entry=task_config.entry, wallet=wallet, netuid=netuid,
                         signer_client=signer_client, http_host=http_host,
                         http_port=http_port, cap=task_config.emission_cap,
-                        set_weights=set_weights,
+                        set_weights=set_weights, read_registry=_corpus_hot_registry_reader(),
+                        **_corpus_remote_audit_options(),
                     )
-                except RuntimeError as exc:
+                except (RuntimeError, ValueError) as exc:
                     logger.critical("%s; fix the declaration before starting this validator", exc)
                     raise typer.Exit(code=4) from exc
                 return
