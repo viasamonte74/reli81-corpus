@@ -1,267 +1,182 @@
-"""Starting one corpus validator on several task ids, and the contract it runs."""
+"""`corpus mine --extra-job`: which jobs one engine may serve beside the main one."""
 
 from __future__ import annotations
 
-from dataclasses import asdict, replace
+import copy
 import json
 
+import httpx
 import pytest
-from typer.testing import CliRunner
+import typer
+
+from reliquary.cli.main import _extra_corpus_job, _parse_prompt_caches
+from reliquary.corpus.job import parse_job
+from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, TOPLOC_DEPLOYED_DEFAULTS
+
+MATH = {
+    "schema": "reliquary/corpus-job/v1", "job_id": "math-v1",
+    "checkpoint_repo": "Qwen/Qwen3.8-27B", "checkpoint_revision": "1d4bf0f2",
+    "checkpoint_sha256": "3e" * 32, "eos_token_id": 248046,
+    "filter": {"grader_id": "math", "threshold": 1.0},
+    "prompt_count": 10, "prompt_order": "miner_walk", "prompt_source": "math",
+    "prompt_start": 0, "renderer_id": "chat-template-thinking-v1",
+    "sampling": {"max_new_tokens": 32768, "min_new_tokens": 16, "n": 8,
+                 "temperature": 1.0, "top_k": 20, "top_p": 0.95},
+    "slots_per_prompt": 1, "deadline_round": None,
+}
+LOGIC = {**MATH, "job_id": "logic-v1", "prompt_source": "reliquary_logic_v2",
+         "prompt_start": 100, "prompt_count": 3,
+         "filter": {"grader_id": "reliquary_logic_v2", "threshold": 1.0},
+         "sampling": {**MATH["sampling"], "n": 2}}
+
+
+def _contract(profile_id="corpus-logic-v1", **proof):
+    contract = ACTIVE_PROTOCOL_PROFILE.to_generation_contract()
+    contract["profile_id"] = profile_id
+    contract["proofs"] = [{**TOPLOC_DEPLOYED_DEFAULTS.to_contract(), **proof}]
+    return contract
+
+
+class _Tokenizer:
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, enable_thinking):
+        (message,) = messages
+        return f"<user>{message['content']}</user><think={enable_thinking}>"
+
+
+def _http(job, contract, failures=()):
+    failures = list(failures)
+
+    def handle(request):
+        if failures:
+            failure = failures.pop(0)
+            if isinstance(failure, Exception):
+                raise failure
+            return httpx.Response(failure, json={"detail": "busy"})
+        if request.url.path == f"/corpus/jobs/{job['job_id']}/job":
+            return httpx.Response(200, json=job)
+        if request.url.path == f"/corpus/jobs/{job['job_id']}/contract":
+            return httpx.Response(200, json=contract)
+        return httpx.Response(404, json={"detail": "corpus_job_not_served"})
+
+    return httpx.Client(transport=httpx.MockTransport(handle), base_url="http://v")
+
+
+def _cache(tmp_path, job, rows=("a", "b", "c"), profile_id="corpus-logic-v1"):
+    path = tmp_path / "prompts.jsonl"
+    head = {"schema": "reliquary/corpus-prompt-cache/v1", "job_id": job["job_id"],
+            "prompt_source": job["prompt_source"], "prompt_start": job["prompt_start"],
+            "prompt_count": job["prompt_count"], "profile_id": profile_id,
+            "environment_manifest_sha256": "f" * 64}
+    path.write_text("\n".join([json.dumps(head)] + [json.dumps(r) for r in rows]) + "\n")
+    return str(path)
+
+
+def _extra(job=LOGIC, contract=None, cache_path=None):
+    return _extra_corpus_job(
+        _http(job, contract or _contract()), job["job_id"], primary=parse_job(MATH),
+        proof=TOPLOC_DEPLOYED_DEFAULTS, tokenizer=_Tokenizer(), encode=None,
+        cache_path=cache_path)
+
+
+def test_a_compatible_job_renders_its_cached_rows_through_the_chat_template(tmp_path):
+    job, client, render, profile_id = _extra(cache_path=_cache(tmp_path, LOGIC))
+    assert job.job_id == "logic-v1" and job.sampling.n == 2
+    assert profile_id == "corpus-logic-v1"
+    assert render(101) == "<user>b</user><think=True>"
+    assert client.contract()["profile_id"] == "corpus-logic-v1"
+
+
+def _changed(path, value):
+    job = copy.deepcopy(LOGIC)
+    *parents, leaf = path
+    target = job
+    for key in parents:
+        target = target[key]
+    target[leaf] = value
+    return job
+
+
+@pytest.mark.parametrize("path,value", [
+    (("checkpoint_revision",), "other"),
+    (("checkpoint_sha256",), "ab" * 32),
+    (("eos_token_id",), 1),
+    (("sampling", "top_p"), 0.9),
+    (("sampling", "max_new_tokens"), 8192),
+    (("sampling", "temperature"), 0.6),
+])
+def test_a_job_one_engine_cannot_serve_is_refused(tmp_path, capsys, path, value):
+    job = _changed(path, value)
+    with pytest.raises(typer.Exit) as exc:
+        _extra(job=job, cache_path=_cache(tmp_path, job))
+    assert exc.value.exit_code == 2
+    assert path[-1] in capsys.readouterr().err
 
-from reliquary.environment.abi import canonical_sha256
-from reliquary.validator.task_config import (
-    TaskConfigError,
-    merge_corpus_contracts,
-    resolve_corpus_task_configs,
-)
-from tests.unit.test_jobs_cli import _rl_entry, registry  # noqa: F401
 
-PROFILE_ID = "corpus-multi-test"
+def test_a_job_proved_differently_is_refused(tmp_path, capsys):
+    with pytest.raises(typer.Exit):
+        _extra(contract=_contract(chunk_tokens=64), cache_path=_cache(tmp_path, LOGIC))
+    assert "proves completions differently" in capsys.readouterr().err
 
 
-def _process_contract():
-    """Two environments, a toploc proof and an architecture: what a merged
-    corpus contract looks like."""
-    from reliquary.cli.main import _with_enforced_toploc
-    from reliquary.constants import PROTOCOL_GENERATION_CONTRACT
+def test_a_prompt_cache_rendered_under_another_profile_is_refused(tmp_path, capsys):
+    with pytest.raises(typer.Exit):
+        _extra(cache_path=_cache(tmp_path, LOGIC, profile_id="corpus-logic-v0"))
+    assert "corpus-logic-v0" in capsys.readouterr().err
 
-    contract = _with_enforced_toploc(dict(PROTOCOL_GENERATION_CONTRACT))
-    return {**contract, "profile_id": PROFILE_ID, "model_architecture": "Qwen3ForCausalLM"}
 
+def test_a_source_the_active_contract_lacks_needs_a_prompt_cache(capsys):
+    assert "reliquary_logic_v2" not in ACTIVE_PROTOCOL_PROFILE.environments
+    with pytest.raises(typer.Exit):
+        _extra()
+    assert "--prompt-cache" in capsys.readouterr().err
 
-def _narrowed(contract, environment):
-    return {**contract, "environments": {environment: contract["environments"][environment]}}
 
+def test_the_main_job_cannot_be_its_own_extra(tmp_path, capsys):
+    with pytest.raises(typer.Exit):
+        _extra(job=MATH, contract=_contract("corpus-math-v1"))
+    assert "--job-id job" in capsys.readouterr().err
 
-def _corpus_entry(task_id, job_id, environment, cap, contract=None):
-    from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION, TaskEntry
-    from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
 
-    contract = contract if contract is not None else _narrowed(_process_contract(), environment)
-    params = asdict(PRODUCTION_PRICE_PARAMS)
-    params["cap"] = params["floor"] = cap
-    return TaskEntry(
-        task_id=task_id, profile_id=PROFILE_ID, profile_sha256=canonical_sha256(contract),
-        mechanism=MECHANISM_CORPUS_GENERATION, params=params, status="active",
-        retired_at=None, job_id=job_id, contract=contract,
-    )
+def test_an_unserved_extra_job_is_refused(capsys):
+    client = _http(LOGIC, _contract())
+    with pytest.raises(typer.Exit):
+        _extra_corpus_job(client, "nope", primary=parse_job(MATH),
+                          proof=TOPLOC_DEPLOYED_DEFAULTS, tokenizer=_Tokenizer(),
+                          encode=None, cache_path=None)
+    assert "nope" in capsys.readouterr().err
 
 
-def _entries():
-    return {
-        "corpus-math": _corpus_entry("corpus-math", "math-v1", "openmathinstruct", 0.1),
-        "corpus-code": _corpus_entry("corpus-code", "code-v1", "opencodeinstruct", 0.2),
-    }
+def _fetching(failures, tmp_path, attempts=8):
+    slept = []
+    result = _extra_corpus_job(
+        _http(LOGIC, _contract(), failures), "logic-v1", primary=parse_job(MATH),
+        proof=TOPLOC_DEPLOYED_DEFAULTS, tokenizer=_Tokenizer(), encode=None,
+        cache_path=_cache(tmp_path, LOGIC), fetch_attempts=attempts, sleep=slept.append)
+    return result, slept
 
 
-def _resolve(entries, ids=("corpus-math", "corpus-code"), process=None):
-    return resolve_corpus_task_configs(
-        entries, ids, profile_id=PROFILE_ID,
-        generation_contract=process if process is not None else _process_contract(),
-    )
+def test_a_busy_validator_is_waited_for(tmp_path):
+    (job, *_), slept = _fetching(
+        [503, httpx.ReadTimeout("timed out"), 504, httpx.ConnectError("refused")], tmp_path)
+    assert job.job_id == "logic-v1" and slept == [5, 10, 20, 40]
 
 
-# --------------------------------------------------------------------------
-# merge_corpus_contracts
-# --------------------------------------------------------------------------
+def test_a_validator_busy_past_every_attempt_refuses_the_job(tmp_path, capsys):
+    with pytest.raises(typer.Exit):
+        _fetching([503] * 3, tmp_path, attempts=3)
+    assert "did not serve it" in capsys.readouterr().err
 
 
-def test_merging_two_narrowed_contracts_gives_back_the_whole():
-    entries = _entries()
-    merged = merge_corpus_contracts({t: e.contract for t, e in entries.items()})
-    assert merged == _process_contract()
+def test_a_client_error_is_not_retried(tmp_path, capsys):
+    with pytest.raises(typer.Exit):
+        _fetching([400, 503], tmp_path)
+    assert "400" in capsys.readouterr().err
 
 
-def test_merging_contracts_with_different_proofs_names_the_field_and_tasks():
-    entries = _entries()
-    other = json.loads(json.dumps(entries["corpus-code"].contract))
-    other["proofs"][0]["mant_mean_threshold"] += 10.0
-    with pytest.raises(ValueError) as caught:
-        merge_corpus_contracts({"corpus-math": entries["corpus-math"].contract, "corpus-code": other})
-    assert "proofs" in str(caught.value)
-    assert "corpus-math" in str(caught.value) and "corpus-code" in str(caught.value)
-
-
-def test_merging_one_environment_declared_two_ways_refuses():
-    contract = _process_contract()
-    a = _narrowed(contract, "openmathinstruct")
-    b = json.loads(json.dumps(a))
-    b["environments"]["openmathinstruct"]["max_new_tokens"] += 1
-    with pytest.raises(ValueError, match="openmathinstruct"):
-        merge_corpus_contracts({"corpus-a": a, "corpus-b": b})
-
-
-# --------------------------------------------------------------------------
-# resolve_corpus_task_configs
-# --------------------------------------------------------------------------
-
-
-def test_two_corpus_tasks_resolve_in_order_with_their_own_caps():
-    configs = _resolve(_entries())
-    assert [c.task_id for c in configs] == ["corpus-math", "corpus-code"]
-    assert [c.entry.job_id for c in configs] == ["math-v1", "code-v1"]
-    assert [c.emission_cap for c in configs] == [pytest.approx(0.1), pytest.approx(0.2)]
-
-
-def test_an_rl_task_among_the_ids_refuses():
-    entries = {**_entries(), "default": _rl_entry("default", 0.5)}
-    with pytest.raises(TaskConfigError, match="corpus"):
-        _resolve(entries, ids=("corpus-math", "default"))
-
-
-def test_an_undeclared_id_refuses():
-    with pytest.raises(TaskConfigError, match="corpus-nope"):
-        _resolve(_entries(), ids=("corpus-math", "corpus-nope"))
-
-
-def test_a_process_running_one_tasks_contract_refuses_with_the_remedy():
-    process = _entries()["corpus-math"].contract
-    with pytest.raises(TaskConfigError) as caught:
-        _resolve(_entries(), process=process)
-    message = str(caught.value)
-    assert "corpus-code" in message and "environments" in message
-    assert "tasks contract" in message
-
-
-def test_a_task_whose_toploc_proof_differs_refuses_naming_proofs():
-    entries = _entries()
-    other = json.loads(json.dumps(entries["corpus-code"].contract))
-    other["proofs"][0]["mant_mean_threshold"] += 10.0
-    entries["corpus-code"] = _corpus_entry("corpus-code", "code-v1", "opencodeinstruct", 0.2,
-                                           contract=other)
-    with pytest.raises(TaskConfigError, match="proofs"):
-        _resolve(entries)
-
-
-def test_a_legacy_entry_without_a_contract_refuses():
-    entries = _entries()
-    entries["corpus-code"] = replace(entries["corpus-code"], contract=None)
-    with pytest.raises(TaskConfigError, match="contract"):
-        _resolve(entries)
-
-
-# --------------------------------------------------------------------------
-# The CLI
-# --------------------------------------------------------------------------
-
-
-def _boot(monkeypatch, registry, ids, side_effect=None):  # noqa: F811
-    from types import SimpleNamespace
-
-    import bittensor
-    import reliquary.cli.main as cli_module
-    import reliquary.constants as constants
-    import reliquary.infrastructure.chain as chain
-    import reliquary.validator.corpus_validator as corpus_validator
-
-    monkeypatch.setattr(constants, "TASK_IDS", tuple(ids))
-    monkeypatch.setattr(constants, "PROTOCOL_PROFILE_ID", PROFILE_ID)
-    monkeypatch.setattr(constants, "PROTOCOL_GENERATION_CONTRACT", _process_contract())
-    monkeypatch.setattr(bittensor, "Wallet", lambda **kw: SimpleNamespace())
-
-    async def subtensor():
-        return SimpleNamespace()
-
-    monkeypatch.setattr(chain, "get_subtensor", subtensor)
-    calls = []
-
-    async def fake_run(**kwargs):
-        calls.append(kwargs)
-        if side_effect is not None:
-            raise side_effect
-
-    monkeypatch.setattr(corpus_validator, "run_corpus_validator", fake_run)
-    return CliRunner().invoke(cli_module.app, ["validate"]), calls
-
-
-def test_validate_on_two_corpus_ids_starts_one_validator_for_both(monkeypatch, registry):  # noqa: F811
-    registry["entries"] = _entries()
-
-    result, calls = _boot(monkeypatch, registry, ["corpus-math", "corpus-code"])
-
-    assert result.exit_code == 0, (result.output, result.exception)
-    assert len(calls) == 1
-    jobs = calls[0]["jobs"]
-    assert [(e.task_id, e.job_id) for e, _ in jobs] == [("corpus-math", "math-v1"),
-                                                        ("corpus-code", "code-v1")]
-    assert [cap for _, cap in jobs] == [pytest.approx(0.1), pytest.approx(0.2)]
-    assert calls[0]["set_weights"] is False
-
-
-def test_validate_on_ids_mixing_rl_and_corpus_exits_four(monkeypatch, registry):  # noqa: F811
-    registry["entries"] = {"corpus-math": _entries()["corpus-math"],
-                           "logic": _rl_entry("logic", 0.5)}
-
-    result, calls = _boot(monkeypatch, registry, ["corpus-math", "logic"])
-
-    assert result.exit_code == 4, (result.output, result.exception)
-    assert calls == []
-
-
-def test_a_multi_job_startup_refusal_exits_four(monkeypatch, registry):  # noqa: F811
-    registry["entries"] = _entries()
-
-    result, calls = _boot(monkeypatch, registry, ["corpus-math", "corpus-code"],
-                          side_effect=RuntimeError("job 'code-v1' declares checkpoint_sha256 ..."))
-
-    assert result.exit_code == 4, (result.output, result.exception)
-    assert len(calls) == 1
-
-
-def test_tasks_contract_with_two_ids_prints_the_merged_contract(registry):  # noqa: F811
-    from reliquary.cli.main import app
-
-    registry["entries"] = _entries()
-    result = CliRunner().invoke(app, ["tasks", "contract", "--task-id", "corpus-math",
-                                      "--task-id", "corpus-code"])
-    assert result.exit_code == 0, result.output
-    assert json.loads(result.output) == _process_contract()
-
-
-def test_tasks_contract_with_one_id_is_unchanged(registry):  # noqa: F811
-    from reliquary.cli.main import app
-
-    registry["entries"] = _entries()
-    result = CliRunner().invoke(app, ["tasks", "contract", "--task-id", "corpus-math"])
-    assert result.exit_code == 0, result.output
-    assert result.output == json.dumps(_entries()["corpus-math"].contract, sort_keys=True,
-                                       separators=(",", ":")) + "\n"
-
-
-def test_tasks_contract_refuses_contracts_that_cannot_share_a_process(registry):  # noqa: F811
-    from reliquary.cli.main import app
-
-    entries = _entries()
-    other = json.loads(json.dumps(entries["corpus-code"].contract))
-    other["proofs"][0]["mant_mean_threshold"] += 10.0
-    entries["corpus-code"] = _corpus_entry("corpus-code", "code-v1", "opencodeinstruct", 0.2,
-                                           contract=other)
-    registry["entries"] = entries
-    result = CliRunner().invoke(app, ["tasks", "contract", "--task-id", "corpus-math",
-                                      "--task-id", "corpus-code"])
-    assert result.exit_code == 1
-    assert "proofs" in result.output
-
-
-def test_the_job_set_is_hot_only_when_the_operator_opts_in(monkeypatch, registry):  # noqa: F811
-    registry["entries"] = _entries()
-    monkeypatch.delenv("RELIQUARY_CORPUS_HOT_JOBS", raising=False)
-    result, calls = _boot(monkeypatch, registry, ["corpus-math", "corpus-code"])
-    assert result.exit_code == 0, (result.output, result.exception)
-    assert calls[0]["read_registry"] is None
-
-    monkeypatch.setenv("RELIQUARY_CORPUS_HOT_JOBS", "1")
-    result, calls = _boot(monkeypatch, registry, ["corpus-math", "corpus-code"])
-    assert result.exit_code == 0, (result.output, result.exception)
-    import asyncio
-
-    assert set(asyncio.run(calls[0]["read_registry"]())) == set(registry["entries"])
-
-
-def test_a_bad_recheck_fraction_exits_four_with_the_critical_line(monkeypatch, registry):  # noqa: F811
-    registry["entries"] = _entries()
-    monkeypatch.setenv("RELIQUARY_CORPUS_REMOTE_AUDIT", "1")
-    monkeypatch.setenv("RELIQUARY_CORPUS_RECHECK_FRACTION", "0")
-    result, calls = _boot(monkeypatch, registry, ["corpus-math", "corpus-code"])
-    assert result.exit_code == 4, (result.output, result.exception)
-    assert calls == []
+def test_prompt_caches_are_named_by_job():
+    assert _parse_prompt_caches(["logic-v1=/a/b.jsonl", "code-v1=c=d"]) == {
+        "logic-v1": "/a/b.jsonl", "code-v1": "c=d"}
+    assert _parse_prompt_caches(None) == {}
+    for bad in ("logic-v1", "=x", "logic-v1="):
+        with pytest.raises(typer.BadParameter):
+            _parse_prompt_caches([bad])

@@ -1662,6 +1662,30 @@ corpus_app = typer.Typer(name="corpus", help="Mine a corpus generation task")
 app.add_typer(corpus_app)
 
 
+def _served_or_exit(read, *, label: str = "", attempts: int = 8, sleep=None):
+    """``read()``, retried while the validator is busy (timeouts, 5xx); any
+    other refusal, or a validator busy past every attempt, exits."""
+    import time
+
+    import httpx
+
+    from reliquary.miner.corpus_miner import CorpusJobSelectionError
+
+    for attempt in range(attempts):
+        try:
+            return read()
+        except CorpusJobSelectionError as exc:
+            typer.echo(f"error: {label}{exc}", err=True)
+            raise typer.Exit(code=2) from exc
+        except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+            if (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500
+                    or attempt == attempts - 1):
+                typer.echo(f"error: {label}the validator did not serve it: {exc}", err=True)
+                raise typer.Exit(code=2) from exc
+            typer.echo(f"{label}{exc}; retrying", err=True)
+            (sleep or time.sleep)(min(60, 5 * 2 ** attempt))
+
+
 def _restart_with_served_contract(validator_url: str, job_id: str | None = None) -> None:
     """Take the task's contract from the validator and restart with it: the
     active profile is fixed when this process imports it. With ``job_id``,
@@ -1674,19 +1698,14 @@ def _restart_with_served_contract(validator_url: str, job_id: str | None = None)
 
     from reliquary.miner.corpus_miner import (
         CorpusContractError,
-        CorpusJobSelectionError,
         HttpCorpusClient,
         save_served_contract,
     )
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
 
     client = HttpCorpusClient(httpx.Client(base_url=validator_url, timeout=60.0), job_id=job_id)
-    try:
-        raw = client.job()
-        contract = client.contract()
-    except CorpusJobSelectionError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=2) from exc
+    raw = _served_or_exit(client.job)
+    contract = _served_or_exit(client.contract)
     job = SimpleNamespace(job_id=raw.get("job_id"), checkpoint_repo=raw.get("checkpoint_repo"),
                           checkpoint_revision=raw.get("checkpoint_revision"))
     cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "reliquary" / "corpus"
@@ -1831,6 +1850,94 @@ def corpus_qualify(
     typer.echo(json.dumps(answer))
 
 
+def _parse_prompt_caches(entries) -> dict[str, str]:
+    caches = {}
+    for entry in entries or ():
+        job_id, sep, path = entry.partition("=")
+        if not sep or not job_id or not path:
+            raise typer.BadParameter(f"--prompt-cache takes JOB_ID=PATH, not {entry!r}")
+        caches[job_id] = path
+    return caches
+
+
+def _extra_corpus_job(http, job_id: str, *, primary, proof, tokenizer, encode, cache_path,
+                      fetch_attempts: int = 8, sleep=None):
+    """An --extra-job's manifest, client, row renderer and contract profile id;
+    refused unless one engine can serve it beside ``primary``."""
+    import dataclasses
+
+    from reliquary.corpus.job import parse_job
+    from reliquary.environment.agentic.types import EpisodeTask
+    from reliquary.eval.prompt_source import is_eval_source
+    from reliquary.miner.corpus_miner import HttpCorpusClient
+    from reliquary.protocol.profiles import (
+        ACTIVE_PROTOCOL_PROFILE, profile_from_contract, toploc_proof,
+    )
+    from reliquary.validator.corpus_service import (
+        CHAT_TEMPLATE_RENDERERS, ChatTemplatePromptRenderer, prompt_job_for_spec,
+        renderer_for_job,
+    )
+
+    def refuse(reason: str):
+        typer.echo(f"error: --extra-job {job_id}: {reason}", err=True)
+        raise typer.Exit(code=2)
+
+    def fetch(read):
+        return _served_or_exit(read, label=f"--extra-job {job_id}: ",
+                               attempts=fetch_attempts, sleep=sleep)
+
+    client = HttpCorpusClient(http, job_id=job_id)
+    job = parse_job(fetch(client.job))
+    contract = fetch(client.contract)
+    if job.job_id == primary.job_id:
+        refuse("it is the --job-id job")
+    if is_eval_source(job.prompt_source):
+        refuse("an eval job is mined on its own")
+    for field in ("checkpoint_repo", "checkpoint_revision", "checkpoint_sha256",
+                  "eos_token_id", "prompt_order"):
+        if getattr(job, field) != getattr(primary, field):
+            refuse(f"its {field} differs from {primary.job_id}'s")
+    ours, theirs = dataclasses.asdict(primary.sampling), dataclasses.asdict(job.sampling)
+    ours.pop("n"), theirs.pop("n")
+    if ours != theirs:
+        refuse(f"its sampling {theirs} differs from {primary.job_id}'s {ours} (n aside)")
+    extra_proof = toploc_proof(profile_from_contract(contract))
+    if extra_proof is None or (extra_proof.chunk_tokens, extra_proof.topk, extra_proof.scheme) != (
+            proof.chunk_tokens, proof.topk, proof.scheme):
+        refuse("its contract proves completions differently")
+
+    if cache_path is not None:
+        from reliquary.miner.prompt_cache import PromptCache, PromptCacheError
+
+        if job.renderer_id not in CHAT_TEMPLATE_RENDERERS:
+            refuse(f"a prompt cache holds rows for a chat template, not {job.renderer_id!r}")
+        try:
+            cache = PromptCache(cache_path, job)
+        except (OSError, PromptCacheError) as exc:
+            refuse(f"its prompt cache is unusable: {exc}")
+        if cache.header.get("profile_id") != contract.get("profile_id"):
+            refuse(f"its prompt cache was rendered under {cache.header.get('profile_id')!r}, "
+                   f"the job's contract is {contract.get('profile_id')!r}")
+        renderer = ChatTemplatePromptRenderer(
+            tokenizer, thinking=CHAT_TEMPLATE_RENDERERS[job.renderer_id])
+
+        def render(index: int) -> str:
+            return renderer.initial_text(EpisodeTask(
+                id=f"{job.prompt_source}#{index}", prompt=cache.prompt(index), tools=()))
+    else:
+        # Rows render through the process's one active profile, which must
+        # then declare this job's source as well.
+        if job.prompt_source not in ACTIVE_PROTOCOL_PROFILE.environments:
+            refuse(f"the active contract declares no {job.prompt_source!r}: give its rows "
+                   "with --prompt-cache")
+        renderer = renderer_for_job(job, encode, tokenizer=tokenizer)
+        prompts = prompt_job_for_spec(job)
+
+        def render(index: int) -> str:
+            return renderer.initial_text(prompts.task_for(index))
+    return job, client, render, str(contract.get("profile_id"))
+
+
 @corpus_app.command("mine")
 def corpus_mine(
     validator_url: str = typer.Option(..., "--validator-url"),
@@ -1861,6 +1968,16 @@ def corpus_mine(
         help="Start prompts while the KV blocks actually free leave this share of "
              "the pool spare, instead of reserving every prompt's full length; a "
              "request vLLM then preempts is recomputed",
+    ),
+    extra_job: list[str] = typer.Option(
+        None, "--extra-job",
+        help="Also mine this job on the same model and engine (repeatable); it must "
+             "share the --job-id job's checkpoint, eos, proof and sampling (n aside)",
+    ),
+    prompt_cache: list[str] = typer.Option(
+        None, "--prompt-cache",
+        help="JOB_ID=PATH: an --extra-job's rows as rendered by `python -m "
+             "reliquary.miner.prompt_cache` (for a source this environment cannot build)",
     ),
 ) -> None:
     """Generate for the corpus job the validator serves, and submit it."""
@@ -1943,6 +2060,20 @@ def corpus_mine(
             raise typer.Exit(code=2) from exc
     renderer = renderer_for_job(job, encode, tokenizer=tokenizer)
     prompts = prompt_job_for_spec(job)
+    # Settled before the engine loads, so a job refused costs no model load.
+    extras = []
+    if extra_job:
+        if is_eval_source(job.prompt_source):
+            typer.echo("error: an eval job is mined on its own, without --extra-job", err=True)
+            raise typer.Exit(code=2)
+        caches = _parse_prompt_caches(prompt_cache)
+        for extra_id in dict.fromkeys(extra_job):
+            extras.append(_extra_corpus_job(
+                http, extra_id, primary=job, proof=proof, tokenizer=tokenizer, encode=encode,
+                cache_path=caches.pop(extra_id, None)))
+        if caches:
+            typer.echo(f"error: --prompt-cache names jobs not mined here: {sorted(caches)}", err=True)
+            raise typer.Exit(code=2)
     generator = VllmGenerator(directory, job.sampling, proof, job.eos_token_id,
                               gpu_memory_utilization=gpu_memory_utilization,
                               speculative_tokens=speculative_tokens, kv_headroom=kv_headroom)
@@ -1963,35 +2094,70 @@ def corpus_mine(
     corpus_logger.setLevel(logging.INFO)
     if not corpus_logger.handlers:
         handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        # With several jobs, each mines on a thread named after it.
+        thread = " [%(threadName)s]" if extra_job else ""
+        handler.setFormatter(logging.Formatter(f"%(asctime)s %(levelname)s{thread} %(message)s"))
         corpus_logger.addHandler(handler)
         corpus_logger.propagate = False
-    loop = mine_steps
-    if window > 1:
-        import dataclasses
-        import hashlib
-        import json
 
-        hotkey_address = wallet.hotkey.ss58_address
+    import dataclasses
+    import hashlib
+    import json
+
+    hotkey_address = wallet.hotkey.ss58_address
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "reliquary" / "corpus"
+
+    def backlog_for(mined, profile_id: str) -> Backlog:
         fingerprint = hashlib.sha256(json.dumps({
-            "job": dataclasses.asdict(job), "hotkey": hotkey_address,
-            "profile": ACTIVE_PROTOCOL_PROFILE.profile_id,
+            "job": dataclasses.asdict(mined), "hotkey": hotkey_address,
+            "profile": profile_id,
             "proof": [proof.chunk_tokens, proof.topk],
         }, sort_keys=True, default=str).encode()).hexdigest()
-        cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "reliquary" / "corpus"
-        backlog = Backlog(cache / "backlog" / job.job_id / hotkey_address, fingerprint)
-        loop = functools.partial(mine_window, window=window, backlog=backlog)
+        return Backlog(cache / "backlog" / mined.job_id / hotkey_address, fingerprint)
+
+    common = dict(
+        hotkey=hotkey_address, tokenizer=tokenizer,
+        sign=lambda body: sign_corpus_submission(wallet, body),
+        # Full prompts are skipped, not generated for; an older validator
+        # without the routes is mined as before.
+        sign_skip=lambda body: sign_corpus_skip(wallet, body),
+        max_steps=max_steps or None,
+    )
+    render = lambda i: renderer.initial_text(prompts.task_for(i))  # noqa: E731
+    if extras:
+        from reliquary.miner.corpus_miner import JobRun, mine_jobs
+
+        if window <= 1:
+            typer.echo("error: --extra-job needs several prompts generating at once", err=True)
+            raise typer.Exit(code=2)
+        runs = [JobRun(job.job_id, dict(
+            job=job, client=client, render=render, window=window,
+            backlog=backlog_for(job, ACTIVE_PROTOCOL_PROFILE.profile_id), **common))]
+        for extra, extra_client, extra_render, profile_id in extras:
+            extra_window = generator.window(extra.sampling.n)
+            if max_in_flight:
+                extra_window = (min(max_in_flight, max(1, MAX_NUM_SEQS // extra.sampling.n))
+                                if kv_headroom is not None else min(extra_window, max_in_flight))
+            typer.echo(f"also mining {extra.job_id}: up to {extra_window} prompt(s) at once, "
+                       f"n={extra.sampling.n} each", err=True)
+            runs.append(JobRun(extra.job_id, dict(
+                job=extra, client=extra_client, render=extra_render, window=extra_window,
+                backlog=backlog_for(extra, profile_id), **common)))
+        try:
+            counts = mine_jobs(runs, generator)
+        except CorpusMinerHalted as exc:
+            typer.echo(f"error: {exc}", err=True)
+            typer.echo(dict(exc.counts))
+            raise typer.Exit(code=1) from exc
+        typer.echo(counts)
+        return
+
+    loop = mine_steps
+    if window > 1:
+        loop = functools.partial(mine_window, window=window,
+                                 backlog=backlog_for(job, ACTIVE_PROTOCOL_PROFILE.profile_id))
     try:
-        counts = loop(
-            job=job, hotkey=wallet.hotkey.ss58_address, client=client,
-            generator=generator,
-            tokenizer=tokenizer, render=lambda i: renderer.initial_text(prompts.task_for(i)),
-            sign=lambda body: sign_corpus_submission(wallet, body),
-            # Full prompts are skipped, not generated for; an older validator
-            # without the routes is mined as before.
-            sign_skip=lambda body: sign_corpus_skip(wallet, body),
-            max_steps=max_steps or None,
-        )
+        counts = loop(job=job, client=client, generator=generator, render=render, **common)
     except CorpusMinerHalted as exc:
         typer.echo(f"error: {exc}", err=True)
         typer.echo(dict(exc.counts))

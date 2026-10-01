@@ -559,7 +559,8 @@ def mine_window(*, job, hotkey, client, generator, tokenizer, render, sign, wind
                 max_steps: int | None = None, sleep=time.sleep,
                 max_consecutive_failures: int = _MAX_CONSECUTIVE_FAILURES,
                 sign_skip=None, max_lookahead: int = 256,
-                backlog: Backlog | None = None, submit_executor=None) -> dict[str, int]:
+                backlog: Backlog | None = None, submit_executor=None,
+                max_prompt_mismatches: int = 3) -> dict[str, int]:
     """Mine like ``mine_steps``, with up to ``window`` prompts generating at once.
 
     The route accepts a hotkey's submission only at its ledger cursor, so the
@@ -577,6 +578,10 @@ def mine_window(*, job, hotkey, client, generator, tokenizer, render, sign, wind
 
     With a ``backlog``, every finished prompt is stored until the route answers
     it, and a restart resumes with the stored prompts still ahead of the ledger.
+
+    ``max_prompt_mismatches`` consecutive ``prompt_mismatch`` answers end the
+    job: the ledger stays on a refused prompt, so prompts this miner renders
+    differently from the validator would otherwise be generated again forever.
     """
     import heapq
 
@@ -591,6 +596,7 @@ def mine_window(*, job, hotkey, client, generator, tokenizer, render, sign, wind
     redo: list[int] = []
     started = 0
     consecutive_unreasoned = 0
+    consecutive_mismatches = 0
     complete = False
 
     def generating() -> int:
@@ -705,7 +711,7 @@ def mine_window(*, job, hotkey, client, generator, tokenizer, render, sign, wind
             _retry, lambda: client.submit(body), **retry_kwargs)))
 
     def answered() -> None:
-        nonlocal ledger, consecutive_unreasoned, complete
+        nonlocal ledger, consecutive_unreasoned, consecutive_mismatches, complete
         cursor, slot, future = submitting.pop()
         answer = future.result()
         if backlog is not None:
@@ -734,6 +740,13 @@ def mine_window(*, job, hotkey, client, generator, tokenizer, render, sign, wind
         if reason in _HALT:
             raise CorpusMinerHalted(f"the validator refused this hotkey: {reason}",
                                     counts=dict(counts))
+        consecutive_mismatches = consecutive_mismatches + 1 if reason == "prompt_mismatch" else 0
+        if consecutive_mismatches >= max_prompt_mismatches:
+            counts["stopped_prompt_mismatch"] += 1
+            logger.error("corpus job %s: %d consecutive prompt_mismatch answers (%s); "
+                         "stopping it", job.job_id, consecutive_mismatches, answer.get("detail"))
+            complete = True
+            return
         if answer.get("accepted"):
             ledger += 1
             return
@@ -804,6 +817,221 @@ def mine_window(*, job, hotkey, client, generator, tokenizer, render, sign, wind
             # in the backlog until a restart reads the ledger past it.
             submitter.shutdown(wait=False, cancel_futures=True)
     return dict(counts)
+
+
+class SharedEngine:
+    """One generator serving several jobs' ``mine_window``, each on its own thread.
+
+    vLLM and the hidden-state capture are touched only by this engine's pump
+    thread: a view's ``start``, ``cancel``, ``room`` and row reads are queued to
+    it and run between engine steps, and every finished request is handed to
+    the view that started it. A job blocked on the validator (a cursor read, a
+    503 backoff) therefore never stalls the engine for the others.
+    """
+
+    def __init__(self, generator, *, idle_wait: float = 0.2) -> None:
+        import queue
+        import threading
+
+        self._generator = generator
+        self._calls: queue.SimpleQueue = queue.SimpleQueue()
+        self._owner: dict[str, _EngineView] = {}
+        self._idle_wait = idle_wait
+        self._stopped = threading.Event()
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(target=self._pump, name="engine", daemon=True)
+        self._thread.start()
+
+    def view(self) -> "_EngineView":
+        return _EngineView(self)
+
+    def call(self, fn, *args):
+        """Run ``fn(*args)`` on the pump thread and return its result."""
+        from concurrent.futures import Future
+
+        if self._error is not None or self._stopped.is_set():
+            raise RuntimeError("the shared engine stopped") from self._error
+        future: Future = Future()
+        self._calls.put((fn, args, future))
+        return future.result()
+
+    def _run_calls(self, block: bool) -> None:
+        import queue
+
+        try:
+            item = self._calls.get(timeout=self._idle_wait) if block else self._calls.get_nowait()
+        except queue.Empty:
+            return
+        while True:
+            fn, args, future = item
+            try:
+                future.set_result(fn(*args))
+            except BaseException as exc:  # handed to the calling job's thread
+                future.set_exception(exc)
+            try:
+                item = self._calls.get_nowait()
+            except queue.Empty:
+                return
+
+    def _pump(self) -> None:
+        try:
+            while not self._stopped.is_set():
+                busy = self._generator.busy()
+                self._run_calls(block=not busy)
+                if not busy:
+                    continue
+                for request_id, tokens in self._generator.step():
+                    view = self._owner.pop(request_id, None)
+                    if view is not None:
+                        view._deliver(request_id, tokens)
+        except BaseException as exc:
+            logger.exception("the shared engine stopped")
+            self._error = exc
+        finally:
+            self._stopped.set()
+            for view in set(self._owner.values()):
+                view._fail()
+            self._fail_waiting_calls()
+
+    def _fail_waiting_calls(self) -> None:
+        import queue
+
+        while True:
+            try:
+                _, _, future = self._calls.get_nowait()
+            except queue.Empty:
+                return
+            future.set_exception(RuntimeError("the shared engine stopped"))
+
+    def stop(self) -> None:
+        self._stopped.set()
+        self._thread.join(timeout=30)
+        self._fail_waiting_calls()
+
+
+class _EngineView:
+    """A ``WindowGenerator`` over a ``SharedEngine``, scoped to one job's requests."""
+
+    def __init__(self, engine: SharedEngine) -> None:
+        import queue
+
+        self._engine = engine
+        self._inbox: queue.SimpleQueue = queue.SimpleQueue()
+        # Changed only on the pump thread; read by the job's.
+        self._pending = 0
+
+    def _deliver(self, request_id: str, tokens: list[int]) -> None:
+        self._inbox.put((request_id, tokens))
+        self._pending -= 1
+
+    def _fail(self) -> None:
+        self._inbox.put(None)
+
+    def _start(self, prompt_ids, n):
+        request_ids = self._engine._generator.start(prompt_ids, n)
+        for request_id in request_ids:
+            self._engine._owner[request_id] = self
+        self._pending += len(request_ids)
+        return request_ids
+
+    def start(self, prompt_ids: list[int], n: int) -> list[str]:
+        return self._engine.call(self._start, prompt_ids, n)
+
+    def _cancel(self, request_ids):
+        generator = self._engine._generator
+        owned = [r for r in request_ids if self._engine._owner.get(r) is self]
+        for request_id in owned:
+            del self._engine._owner[request_id]
+        self._pending -= len(owned)
+        generator.cancel(owned)
+        # Finished but not yet taken from the inbox: nothing to abort, but their
+        # rows are still captured.
+        finished = [r for r in request_ids if r not in owned]
+        if finished and callable(getattr(generator, "forget", None)):
+            generator.forget(finished)
+
+    def cancel(self, request_ids: list[str]) -> None:
+        if request_ids:
+            self._engine.call(self._cancel, list(request_ids))
+
+    def room(self, prompt_len: int, n: int) -> bool:
+        return self._engine.call(self._engine._generator.room, prompt_len, n)
+
+    def finish(self, request_id: str, prompt_len: int, tokens: list[int]) -> Generation:
+        generator = self._engine._generator
+        rows = self._engine.call(generator.rows_for, request_id, prompt_len, tokens)
+        return generator.prove(rows, tokens)
+
+    def step(self) -> list[tuple[str, list[int]]]:
+        import queue
+
+        try:
+            items = [self._inbox.get(timeout=self._engine._idle_wait)]
+        except queue.Empty:
+            if self._engine._stopped.is_set():
+                raise RuntimeError("the shared engine stopped") from self._engine._error
+            return []
+        while True:
+            try:
+                items.append(self._inbox.get_nowait())
+            except queue.Empty:
+                break
+        if any(item is None for item in items):
+            raise RuntimeError("the shared engine stopped") from self._engine._error
+        return items
+
+    def busy(self) -> bool:
+        return self._pending > 0 or not self._inbox.empty()
+
+    def window(self, n: int) -> int:
+        return self._engine._generator.window(n)
+
+
+@dataclass
+class JobRun:
+    """One job of ``mine_jobs``: ``mine_window``'s keyword arguments but the generator."""
+
+    name: str
+    kwargs: dict
+
+
+def mine_jobs(runs: list[JobRun], generator) -> dict[str, dict]:
+    """Mine several jobs at once on one generator, each with ``mine_window`` on
+    its own thread (named after the job). One job ending -- complete, retired,
+    stopped -- leaves the others mining; a hotkey refusal or an unexpected error
+    in any job stops them all and is raised once every thread has returned."""
+    import threading
+
+    engine = SharedEngine(generator)
+    results: dict[str, dict] = {}
+    failures: list[tuple[str, BaseException]] = []
+    stop = threading.Event()
+
+    def run(job_run: JobRun) -> None:
+        try:
+            results[job_run.name] = mine_window(generator=engine.view(), **job_run.kwargs)
+        except BaseException as exc:
+            failures.append((job_run.name, exc))
+            stop.set()
+
+    threads = [threading.Thread(target=run, args=(job_run,), name=job_run.name, daemon=True)
+               for job_run in runs]
+    for thread in threads:
+        thread.start()
+    try:
+        while any(thread.is_alive() for thread in threads):
+            if stop.is_set():
+                # The other jobs' next engine call raises, which ends them.
+                engine.stop()
+            for thread in threads:
+                thread.join(timeout=1.0)
+    finally:
+        engine.stop()
+    if failures:
+        name, exc = failures[0]
+        logger.error("corpus job %s stopped every job: %s", name, exc)
+        raise exc
+    return results
 
 
 # Room for the rendered prompt beside the job's completion budget.
@@ -1092,13 +1320,20 @@ class VllmGenerator:
 
     def finish(self, request_id: str, prompt_len: int, tokens: list[int]) -> Generation:
         """Prove a finished request; ValueError when its captured rows do not fit it."""
-        import base64
+        return self.prove(self.rows_for(request_id, prompt_len, tokens), tokens)
 
+    def rows_for(self, request_id: str, prompt_len: int, tokens: list[int]):
+        """A finished request's completion rows, taken out of the capture."""
         from reliquary.miner.vllm_hidden_capture import completion_rows
-        from reliquary.protocol.toploc_proof import build_chunk_proofs
 
         total = prompt_len + len(tokens)
-        rows = completion_rows(self._capture.pop(request_id, limit=total - 1), prompt_len, total)
+        return completion_rows(self._capture.pop(request_id, limit=total - 1), prompt_len, total)
+
+    def prove(self, rows, tokens: list[int]) -> Generation:
+        import base64
+
+        from reliquary.protocol.toploc_proof import build_chunk_proofs
+
         proofs = build_chunk_proofs(rows, chunk_tokens=self._proof.chunk_tokens, topk=self._proof.topk)
         return Generation(tokens, [base64.b64encode(p).decode() for p in proofs])
 
@@ -1109,6 +1344,11 @@ class VllmGenerator:
         for request_id in request_ids:
             self._engine_ids.pop(request_id.split("-", 1)[0], None)
             self._reserved.pop(request_id, None)
+        self.forget(request_ids)
+
+    def forget(self, request_ids: list[str]) -> None:
+        """Drop the captured rows of requests that will never be proved."""
+        for request_id in request_ids:
             try:
                 self._capture.pop(request_id)
             except KeyError:
