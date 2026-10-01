@@ -842,8 +842,10 @@ class SharedEngine:
         self._thread = threading.Thread(target=self._pump, name="engine", daemon=True)
         self._thread.start()
 
-    def view(self) -> "_EngineView":
-        return _EngineView(self)
+    def view(self, max_tokens: int | None = None) -> "_EngineView":
+        """A job's view; ``max_tokens`` its completion budget when it is not
+        the generator's own."""
+        return _EngineView(self, max_tokens)
 
     def call(self, fn, *args):
         """Run ``fn(*args)`` on the pump thread and return its result."""
@@ -912,10 +914,11 @@ class SharedEngine:
 class _EngineView:
     """A ``WindowGenerator`` over a ``SharedEngine``, scoped to one job's requests."""
 
-    def __init__(self, engine: SharedEngine) -> None:
+    def __init__(self, engine: SharedEngine, max_tokens: int | None = None) -> None:
         import queue
 
         self._engine = engine
+        self._budget = {} if max_tokens is None else {"max_tokens": max_tokens}
         self._inbox: queue.SimpleQueue = queue.SimpleQueue()
         # Changed only on the pump thread; read by the job's.
         self._pending = 0
@@ -928,7 +931,7 @@ class _EngineView:
         self._inbox.put(None)
 
     def _start(self, prompt_ids, n):
-        request_ids = self._engine._generator.start(prompt_ids, n)
+        request_ids = self._engine._generator.start(prompt_ids, n, **self._budget)
         for request_id in request_ids:
             self._engine._owner[request_id] = self
         self._pending += len(request_ids)
@@ -954,8 +957,11 @@ class _EngineView:
         if request_ids:
             self._engine.call(self._cancel, list(request_ids))
 
+    def _room(self, prompt_len, n):
+        return self._engine._generator.room(prompt_len, n, **self._budget)
+
     def room(self, prompt_len: int, n: int) -> bool:
-        return self._engine.call(self._engine._generator.room, prompt_len, n)
+        return self._engine.call(self._room, prompt_len, n)
 
     def finish(self, request_id: str, prompt_len: int, tokens: list[int]) -> Generation:
         generator = self._engine._generator
@@ -989,10 +995,13 @@ class _EngineView:
 
 @dataclass
 class JobRun:
-    """One job of ``mine_jobs``: ``mine_window``'s keyword arguments but the generator."""
+    """One job of ``mine_jobs``: ``mine_window``'s keyword arguments but the
+    generator, and the job's completion budget when it is shorter than the
+    generator's."""
 
     name: str
     kwargs: dict
+    max_tokens: int | None = None
 
 
 def mine_jobs(runs: list[JobRun], generator) -> dict[str, dict]:
@@ -1009,7 +1018,8 @@ def mine_jobs(runs: list[JobRun], generator) -> dict[str, dict]:
 
     def run(job_run: JobRun) -> None:
         try:
-            results[job_run.name] = mine_window(generator=engine.view(), **job_run.kwargs)
+            view = engine.view(job_run.max_tokens)
+            results[job_run.name] = mine_window(generator=view, **job_run.kwargs)
         except BaseException as exc:
             failures.append((job_run.name, exc))
             stop.set()
@@ -1129,7 +1139,7 @@ class VllmGenerator:
             extra["speculative_config"] = {"method": "mtp", "num_speculative_tokens": speculative_tokens}
         self._llm = LLM(model=checkpoint_dir, dtype="bfloat16", enable_prefix_caching=False,
                         seed=seed, **memory, **extra)
-        self._params = SamplingParams(
+        self._sampling_kwargs = dict(
             n=1, temperature=sampling.temperature, top_p=sampling.top_p,
             top_k=sampling.top_k if sampling.top_k > 0 else -1,
             min_tokens=sampling.min_new_tokens, max_tokens=sampling.max_new_tokens,
@@ -1144,6 +1154,10 @@ class VllmGenerator:
             # at the end of `token_ids`, which `completion_text` relies on.
             stop_token_ids=[eos_token_id], ignore_eos=True,
         )
+        self._params = SamplingParams(**self._sampling_kwargs)
+        # Shorter budgets for other jobs on this engine; never longer, since
+        # max_model_len was sized for this one.
+        self._params_by_budget = {sampling.max_new_tokens: self._params}
         self._proof = proof
         self._engine_ids: dict[str, str] = {}
         self._reserved: dict[str, int] = {}
@@ -1186,14 +1200,29 @@ class VllmGenerator:
         length = min(length, max_len)
         return fixed + sum(-(-length // size) for size in block_sizes)
 
-    def _request_blocks(self, prompt_len: int) -> int:
+    def _params_for(self, max_tokens: int | None):
+        if max_tokens is None:
+            return self._params
+        params = self._params_by_budget.get(max_tokens)
+        if params is None:
+            from vllm import SamplingParams
+
+            if max_tokens > self._params.max_tokens:
+                raise ValueError(f"a {max_tokens}-token budget exceeds this engine's "
+                                 f"{self._params.max_tokens}")
+            params = self._params_by_budget[max_tokens] = SamplingParams(
+                **{**self._sampling_kwargs, "max_tokens": max_tokens})
+        return params
+
+    def _request_blocks(self, prompt_len: int, max_tokens: int | None = None) -> int:
         # +1: async scheduling may run one step past the last token.
-        return self._blocks_for(self._kv, prompt_len + self._params.max_tokens + 1)
+        budget = self._params.max_tokens if max_tokens is None else max_tokens
+        return self._blocks_for(self._kv, prompt_len + budget + 1)
 
     def _scheduler(self):
         return self._llm.llm_engine.engine_core.engine_core.scheduler
 
-    def room(self, prompt_len: int, n: int) -> bool:
+    def room(self, prompt_len: int, n: int, max_tokens: int | None = None) -> bool:
         """Whether ``n`` more requests for this prompt fit the KV cache beside those
         generating, every one at its own full length (prompt plus max_tokens);
         with a headroom, whether the blocks actually free cover the prompt and
@@ -1214,7 +1243,7 @@ class VllmGenerator:
             return True
         # The pool's first block is vLLM's null block, never handed out.
         free = self._kv[0] - 1 - sum(self._reserved.values())
-        return n * self._request_blocks(prompt_len) <= free
+        return n * self._request_blocks(prompt_len, max_tokens) <= free
 
     def capacity(self, prompt_len: int, n: int) -> int:
         """How many prompts of ``prompt_len`` tokens ``room`` lets generate at once."""
@@ -1295,13 +1324,15 @@ class VllmGenerator:
             return 1
         return max(1, min(int(concurrency), MAX_NUM_SEQS) // n)
 
-    def start(self, prompt_ids: list[int], n: int) -> list[str]:
-        """Queue ``n`` requests for one prompt; their engine request ids."""
+    def start(self, prompt_ids: list[int], n: int, max_tokens: int | None = None) -> list[str]:
+        """Queue ``n`` requests for one prompt, each completing in at most
+        ``max_tokens`` (the engine's job's budget by default); their engine
+        request ids."""
         from vllm.inputs import TokensPrompt
 
         request_ids = list(self._llm.enqueue([TokensPrompt(prompt_token_ids=prompt_ids)] * n,
-                                             self._params, use_tqdm=False))
-        blocks = self._request_blocks(len(prompt_ids)) if self._kv is not None else 0
+                                             self._params_for(max_tokens), use_tqdm=False))
+        blocks = self._request_blocks(len(prompt_ids), max_tokens) if self._kv is not None else 0
         for request_id in request_ids:
             # Outputs name the id before the engine's "-<random>" suffix.
             self._engine_ids[request_id.split("-", 1)[0]] = request_id

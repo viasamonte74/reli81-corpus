@@ -1897,10 +1897,17 @@ def _extra_corpus_job(http, job_id: str, *, primary, proof, tokenizer, encode, c
                   "eos_token_id", "prompt_order"):
         if getattr(job, field) != getattr(primary, field):
             refuse(f"its {field} differs from {primary.job_id}'s")
+    # Each request carries its own job's n and completion budget; the engine
+    # is sized for the main job's, so an extra job's may only be shorter.
+    if job.sampling.max_new_tokens > primary.sampling.max_new_tokens:
+        refuse(f"its max_new_tokens {job.sampling.max_new_tokens} exceeds "
+               f"{primary.job_id}'s {primary.sampling.max_new_tokens}, which sized the engine")
     ours, theirs = dataclasses.asdict(primary.sampling), dataclasses.asdict(job.sampling)
-    ours.pop("n"), theirs.pop("n")
+    for field in ("n", "max_new_tokens"):
+        ours.pop(field), theirs.pop(field)
     if ours != theirs:
-        refuse(f"its sampling {theirs} differs from {primary.job_id}'s {ours} (n aside)")
+        refuse(f"its sampling {theirs} differs from {primary.job_id}'s {ours} "
+               "(n and max_new_tokens aside)")
     extra_proof = toploc_proof(profile_from_contract(contract))
     if extra_proof is None or (extra_proof.chunk_tokens, extra_proof.topk, extra_proof.scheme) != (
             proof.chunk_tokens, proof.topk, proof.scheme):
@@ -2139,10 +2146,12 @@ def corpus_mine(
                 extra_window = (min(max_in_flight, max(1, MAX_NUM_SEQS // extra.sampling.n))
                                 if kv_headroom is not None else min(extra_window, max_in_flight))
             typer.echo(f"also mining {extra.job_id}: up to {extra_window} prompt(s) at once, "
-                       f"n={extra.sampling.n} each", err=True)
+                       f"n={extra.sampling.n} each, at most {extra.sampling.max_new_tokens} "
+                       "tokens per completion", err=True)
             runs.append(JobRun(extra.job_id, dict(
                 job=extra, client=extra_client, render=extra_render, window=extra_window,
-                backlog=backlog_for(extra, profile_id), **common)))
+                backlog=backlog_for(extra, profile_id), **common),
+                max_tokens=extra.sampling.max_new_tokens))
         try:
             counts = mine_jobs(runs, generator)
         except CorpusMinerHalted as exc:

@@ -63,17 +63,20 @@ class _Engine:
         self.threads = set()
         self.cancelled = []
         self.forgotten = []
+        self.budgets = {}
+        self.room_budgets = set()
         self.lock = threading.Lock()
 
     def _touch(self):
         self.threads.add(threading.current_thread().name)
 
-    def start(self, prompt_ids, n):
+    def start(self, prompt_ids, n, **budget):
         self._touch()
         ids = []
         for _ in range(n):
             self.issued += 1
             ids.append(f"{self.issued}-x")
+            self.budgets[ids[-1]] = (chr(prompt_ids[0]), budget.get("max_tokens"))
         self.live.extend((i, list(prompt_ids)) for i in ids)
         return ids
 
@@ -88,8 +91,9 @@ class _Engine:
         # whether it got its own completion back.
         return [(request_id, [prompt_ids[0], 105, EOS])]
 
-    def room(self, prompt_len, n):
+    def room(self, prompt_len, n, **budget):
         self._touch()
+        self.room_budgets.add(budget.get("max_tokens"))
         return True
 
     def rows_for(self, request_id, prompt_len, tokens):
@@ -133,6 +137,16 @@ def test_two_jobs_on_one_engine_each_submit_their_own_walk_in_order():
                for b in logic.submitted for c in b["completions"])
     assert engine.threads == {"engine"}, "only the pump thread may touch the engine"
     assert not engine.live
+
+
+def test_each_job_generates_under_its_own_completion_budget():
+    engine = _Engine()
+    short = _run("if", _Client(["accepted"] * 3), "i", max_steps=3)
+    short.max_tokens = 8192
+    mine_jobs([_run("math", _Client(["accepted"] * 3), "m", max_steps=3), short], engine)
+    assert {budget for prefix, budget in engine.budgets.values() if prefix == "m"} == {None}
+    assert {budget for prefix, budget in engine.budgets.values() if prefix == "i"} == {8192}
+    assert engine.room_budgets <= {None, 8192}
 
 
 def test_one_job_ending_leaves_the_other_mining():

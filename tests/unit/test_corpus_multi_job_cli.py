@@ -101,7 +101,8 @@ def _changed(path, value):
     (("checkpoint_sha256",), "ab" * 32),
     (("eos_token_id",), 1),
     (("sampling", "top_p"), 0.9),
-    (("sampling", "max_new_tokens"), 8192),
+    (("sampling", "max_new_tokens"), 65536),
+    (("sampling", "min_new_tokens"), 32),
     (("sampling", "temperature"), 0.6),
 ])
 def test_a_job_one_engine_cannot_serve_is_refused(tmp_path, capsys, path, value):
@@ -110,6 +111,13 @@ def test_a_job_one_engine_cannot_serve_is_refused(tmp_path, capsys, path, value)
         _extra(job=job, cache_path=_cache(tmp_path, job))
     assert exc.value.exit_code == 2
     assert path[-1] in capsys.readouterr().err
+
+
+def test_a_shorter_completion_budget_is_served_on_the_same_engine(tmp_path):
+    job = {**_changed(("sampling", "max_new_tokens"), 8192), "renderer_id": "chat-template-v1"}
+    extra, _, render, _ = _extra(job=job, cache_path=_cache(tmp_path, job))
+    assert extra.sampling.max_new_tokens == 8192
+    assert render(100) == "<user>a</user><think=False>"
 
 
 def test_a_job_proved_differently_is_refused(tmp_path, capsys):

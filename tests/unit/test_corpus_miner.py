@@ -697,6 +697,33 @@ def test_room_reserves_each_request_at_its_own_full_length(monkeypatch):
     assert generator.room(300, 1) and not generator.room(8000, 2)
 
 
+def test_a_request_may_carry_a_shorter_budget_than_the_engines(monkeypatch):
+    generator, _ = _hybrid_kv_generator(monkeypatch, num_blocks=1225, reported=7.656)
+    enqueued = []
+    issued = iter(range(1000))
+
+    def enqueue(prompts, params, use_tqdm):
+        enqueued.append(params)
+        return [f"{next(issued)}-ab" for _ in prompts]
+
+    generator._llm.enqueue = enqueue
+    (full,) = generator.start([1] * 300, 1)
+    (short,) = generator.start([1] * 300, 1, max_tokens=8192)
+    assert [p.max_tokens for p in enqueued] == [32768, 8192]
+    assert enqueued[0] is generator._params
+    assert {k: v for k, v in vars(enqueued[1]).items() if k != "max_tokens"} == {
+        k: v for k, v in vars(generator._params).items() if k != "max_tokens"}
+    # Reserved at its own full length: 300 + 8,192 + 1 tokens hold 3 x 11 + 1.
+    assert generator._reserved == {full: 130, short: 34}
+    generator.start([1] * 300, 1, max_tokens=8192)
+    assert enqueued[2] is enqueued[1], "one SamplingParams per budget"
+    # 1,224 - 130 - 2 x 34 = 1,026 left: 7 more full-length requests, or 30 short.
+    assert generator.room(300, 7) and not generator.room(300, 8)
+    assert generator.room(300, 30, max_tokens=8192) and not generator.room(300, 31, max_tokens=8192)
+    with pytest.raises(ValueError, match="exceeds"):
+        generator.start([1] * 300, 1, max_tokens=65536)
+
+
 def test_with_a_headroom_prompts_are_admitted_by_the_blocks_actually_free(monkeypatch):
     from reliquary.miner.corpus_miner import OVERCOMMIT_MAX_IN_FLIGHT
 
