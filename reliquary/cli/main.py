@@ -2,6 +2,7 @@
 
 import asyncio
 import atexit
+import functools
 import logging
 import math
 import os
@@ -1624,6 +1625,22 @@ def corpus_mine(
         None, "--job-id",
         help="The job to mine on a validator serving several; one process mines one job",
     ),
+    max_in_flight: int = typer.Option(
+        0, "--max-in-flight", min=0,
+        help="Most prompts generating at once; 0 = as many as the KV cache holds with "
+             "each at its full length (never more), or 32 with --kv-headroom; "
+             "1 = one at a time",
+    ),
+    speculative_tokens: int = typer.Option(
+        0, "--speculative-tokens", min=0,
+        help="Draft tokens per step from the checkpoint's MTP head; 0 = off",
+    ),
+    kv_headroom: float = typer.Option(
+        None, "--kv-headroom", min=0.0, max=0.9,
+        help="Start prompts while the KV blocks actually free leave this share of "
+             "the pool spare, instead of reserving every prompt's full length; a "
+             "request vLLM then preempts is recomputed",
+    ),
 ) -> None:
     """Generate for the corpus job the validator serves, and submit it."""
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
@@ -1637,11 +1654,14 @@ def corpus_mine(
     from reliquary.corpus.encoding import checkpoint_fingerprint
     from reliquary.corpus.job import parse_job
     from reliquary.miner.corpus_miner import (
+        MAX_NUM_SEQS,
+        Backlog,
         CorpusJobSelectionError,
         CorpusMinerHalted,
         HttpCorpusClient,
         VllmGenerator,
         mine_steps,
+        mine_window,
     )
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
     from reliquary.protocol.signatures import sign_corpus_skip, sign_corpus_submission
@@ -1689,11 +1709,48 @@ def corpus_mine(
 
     renderer = renderer_for_job(job, encode, tokenizer=tokenizer)
     prompts = prompt_job_for_spec(job)
+    generator = VllmGenerator(directory, job.sampling, proof, job.eos_token_id,
+                              gpu_memory_utilization=gpu_memory_utilization,
+                              speculative_tokens=speculative_tokens, kv_headroom=kv_headroom)
+    window = generator.window(job.sampling.n)
+    if max_in_flight:
+        window = (min(max_in_flight, max(1, MAX_NUM_SEQS // job.sampling.n)) if kv_headroom is not None
+                  else min(window, max_in_flight))
+    if kv_headroom is not None:
+        typer.echo(f"generating up to {window} prompt(s) at once while {kv_headroom:.0%} of the "
+                   f"KV cache stays free, n={job.sampling.n} each, "
+                   f"{speculative_tokens} draft token(s) per step", err=True)
+    else:
+        fits = min(window, generator.capacity(512, job.sampling.n))
+        typer.echo(f"generating up to {window} prompt(s) at once as the KV cache allows "
+                   f"(~{fits} for 512-token prompts), n={job.sampling.n} each, "
+                   f"{speculative_tokens} draft token(s) per step", err=True)
+    corpus_logger = logging.getLogger("reliquary.miner.corpus_miner")
+    corpus_logger.setLevel(logging.INFO)
+    if not corpus_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        corpus_logger.addHandler(handler)
+        corpus_logger.propagate = False
+    loop = mine_steps
+    if window > 1:
+        import dataclasses
+        import hashlib
+        import json
+
+        hotkey_address = wallet.hotkey.ss58_address
+        fingerprint = hashlib.sha256(json.dumps({
+            "job": dataclasses.asdict(job), "hotkey": hotkey_address,
+            "profile": ACTIVE_PROTOCOL_PROFILE.profile_id,
+            "proof": [proof.chunk_tokens, proof.topk],
+        }, sort_keys=True, default=str).encode()).hexdigest()
+        cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "reliquary" / "corpus"
+        backlog = Backlog(cache / "backlog" / job.job_id / hotkey_address, fingerprint)
+        loop = functools.partial(mine_window, window=window, backlog=backlog)
     try:
-        counts = mine_steps(
+        counts = loop(
             job=job, hotkey=wallet.hotkey.ss58_address, client=client,
-            generator=VllmGenerator(directory, job.sampling, proof, job.eos_token_id,
-                                    gpu_memory_utilization=gpu_memory_utilization),
+            generator=generator,
             tokenizer=tokenizer, render=lambda i: renderer.initial_text(prompts.task_for(i)),
             sign=lambda body: sign_corpus_submission(wallet, body),
             # Full prompts are skipped, not generated for; an older validator

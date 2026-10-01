@@ -43,28 +43,108 @@ def completion_rows(rows: torch.Tensor, prompt_len: int, total_len: int) -> torc
     return rows[prompt_len - 1 : expected]
 
 
+def _by_position(chunks: list[tuple[torch.Tensor, torch.Tensor | None]], limit: int | None) -> torch.Tensor:
+    """A request's rows in position order. A position computed more than once
+    (a rejected draft token, or a request recomputed after preemption) keeps its
+    last computation: once a position's token is final, no later step computes
+    it again."""
+    if all(positions is None for _, positions in chunks):
+        return torch.cat([rows for rows, _ in chunks], 0)
+    if any(positions is None for _, positions in chunks):
+        raise ValueError("rows recorded both with and without positions")
+    for _, positions in chunks:
+        if positions.numel() > 1 and not bool((positions[1:] - positions[:-1] == 1).all()):
+            raise ValueError("a step's rows for one request are not consecutive positions")
+    rows = torch.cat([rows for rows, _ in chunks], 0)
+    positions = torch.cat([positions for _, positions in chunks], 0)
+    end = int(positions.max()) + 1 if limit is None else limit
+    keep = positions < end
+    last = torch.full((end,), -1, dtype=torch.long)
+    last.scatter_reduce_(0, positions[keep], torch.arange(len(positions))[keep], reduce="amax")
+    missing = int((last < 0).sum())
+    if missing:
+        raise ValueError(f"no rows for {missing} of {end} positions")
+    return rows[last]
+
+
 class HiddenStateCapture:
-    def __init__(self) -> None:
-        self._rows: dict[str, list[torch.Tensor]] = {}
+    """Rows by request. ``non_blocking`` queues each step's copy to pinned host
+    memory behind the forward instead of waiting for the forward to finish, so
+    the scheduler keeps preparing the next step; the rows are the same bits.
 
-    def record(self, order: Sequence[str], scheduled: Mapping[str, int], hidden: torch.Tensor) -> None:
-        for request_id, rows in attribute_rows(order, scheduled, hidden).items():
-            self._rows.setdefault(request_id, []).append(rows.detach().to("cpu", torch.bfloat16))
+    With ``positions`` given to ``record``, rows are reassembled by position,
+    which speculative decoding (rows for rejected draft tokens) and preemption
+    (a request computed again from its start) both need."""
 
-    def for_request(self, request_id: str) -> torch.Tensor:
+    def __init__(self, non_blocking: bool = False) -> None:
+        self._rows: dict[str, list[tuple[torch.Tensor, torch.Tensor | None]]] = {}
+        self._non_blocking = non_blocking
+        self._staged: list[tuple[torch.cuda.Event, torch.Tensor, torch.Tensor | None,
+                                 list[tuple[str, int, int]]]] = []
+
+    def record(self, order: Sequence[str], scheduled: Mapping[str, int], hidden: torch.Tensor,
+               positions: torch.Tensor | None = None) -> None:
+        if positions is not None and positions.dim() == 2:  # M-RoPE: equal rows for text
+            positions = positions[0]
+        spans, offset = [], 0
+        for request_id in order:
+            count = int(scheduled.get(request_id, 0))
+            if count:
+                spans.append((request_id, offset, count))
+                offset += count
+        if offset > hidden.shape[0]:
+            raise ValueError(f"{offset} rows scheduled, {hidden.shape[0]} produced")
+        if positions is not None and offset > positions.shape[0]:
+            raise ValueError(f"{offset} rows scheduled, {positions.shape[0]} positions")
+        if not (self._non_blocking and hidden.is_cuda):
+            host = hidden[:offset].detach().to("cpu", torch.bfloat16)
+            where = None if positions is None else positions[:offset].to("cpu", torch.long)
+            self._keep(host, where, spans)
+            return
+        # Queued on the forward's stream, so it reads the output buffers before
+        # the next step (or CUDA graph replay) can overwrite them.
+        staged = torch.empty((offset, hidden.shape[1]), dtype=torch.bfloat16, pin_memory=True)
+        staged.copy_(hidden[:offset].detach().to(torch.bfloat16), non_blocking=True)
+        where = None
+        if positions is not None:
+            where = torch.empty((offset,), dtype=torch.long, pin_memory=True)
+            where.copy_(positions[:offset].to(torch.long), non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        self._staged.append((event, staged, where, spans))
+        self._settle(wait=False)
+
+    def _keep(self, host: torch.Tensor, where: torch.Tensor | None, spans) -> None:
+        for request_id, start, count in spans:
+            self._rows.setdefault(request_id, []).append((
+                host[start : start + count].clone(),
+                None if where is None else where[start : start + count].clone(),
+            ))
+
+    def _settle(self, *, wait: bool) -> None:
+        while self._staged and (wait or self._staged[0][0].query()):
+            event, staged, where, spans = self._staged.pop(0)
+            event.synchronize()
+            self._keep(staged, where, spans)
+
+    def _match(self, request_id: str) -> str:
+        self._settle(wait=True)
         # The runner suffixes engine ids ("0" becomes "0-ae415201").
         matches = [r for r in self._rows if r == request_id or r.startswith(request_id + "-")]
         if len(matches) != 1:
             raise KeyError(f"{len(matches)} captured requests match {request_id!r}")
-        return torch.cat(self._rows[matches[0]], 0)
+        return matches[0]
 
-    def pop(self, request_id: str) -> torch.Tensor:
+    def for_request(self, request_id: str, limit: int | None = None) -> torch.Tensor:
+        """``limit``: the positions wanted, when rows were recorded with them;
+        later ones (an async step past the end, a final rejected draft) are
+        dropped."""
+        return _by_position(self._rows[self._match(request_id)], limit)
+
+    def pop(self, request_id: str, limit: int | None = None) -> torch.Tensor:
         """Like ``for_request``, but forgets the rows: a long-lived miner process
         must not keep every completion's activations resident forever."""
-        matches = [r for r in self._rows if r == request_id or r.startswith(request_id + "-")]
-        if len(matches) != 1:
-            raise KeyError(f"{len(matches)} captured requests match {request_id!r}")
-        return torch.cat(self._rows.pop(matches[0]), 0)
+        return _by_position(self._rows.pop(self._match(request_id)), limit)
 
 
 def _check_engine_mode() -> None:
@@ -75,11 +155,12 @@ def _check_engine_mode() -> None:
 
 
 @contextlib.contextmanager
-def capture_hidden_states(runner_cls=None) -> Iterator[HiddenStateCapture]:
+def capture_hidden_states(runner_cls=None, *, non_blocking: bool = False,
+                          positional: bool = False) -> Iterator[HiddenStateCapture]:
     _check_engine_mode()
     if runner_cls is None:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner as runner_cls
-    capture = HiddenStateCapture()
+    capture = HiddenStateCapture(non_blocking=non_blocking)
     scheduled: dict[str, int] = {}
     original_execute = runner_cls.execute_model
     original_forward = runner_cls._model_forward
@@ -94,7 +175,11 @@ def capture_hidden_states(runner_cls=None) -> Iterator[HiddenStateCapture]:
         if scheduled:
             hidden = output[0] if isinstance(output, tuple) else output
             batch = self.input_batch
-            capture.record(batch.req_ids[: batch.num_reqs], dict(scheduled), hidden)
+            # The positions the model was given, not the scheduler's: under
+            # async scheduling a step is planned before the last one's draft
+            # tokens are judged, and the runner corrects positions on the GPU.
+            positions = kwargs.get("positions", args[1] if len(args) > 1 else None) if positional else None
+            capture.record(batch.req_ids[: batch.num_reqs], dict(scheduled), hidden, positions)
             scheduled.clear()
         return output
 

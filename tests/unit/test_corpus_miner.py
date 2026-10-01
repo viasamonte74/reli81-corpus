@@ -8,6 +8,7 @@ import pytest
 from reliquary.corpus.encoding import prompt_token_ids
 from reliquary.corpus.walk import walk_index
 from reliquary.miner.corpus_miner import (
+    Backlog,
     CorpusMinerHalted,
     CorpusPermanentFailure,
     CorpusTransientFailure,
@@ -15,6 +16,7 @@ from reliquary.miner.corpus_miner import (
     VllmGenerator,
     build_submission,
     mine_steps,
+    mine_window,
 )
 
 EOS = 99
@@ -253,6 +255,211 @@ def test_a_generation_failure_drops_the_step_and_continues():
     assert client.cursor_reads == 2, "one initial read, one resync after the dropped step"
 
 
+class _WindowGenerator:
+    """Finishes the newest and the oldest request in turn, so later cursors
+    complete before earlier ones, and remembers the most requests in flight."""
+
+    def __init__(self, fail_once=()):
+        self.live = []
+        self.issued = 0
+        self.steps = 0
+        self.peak = 0
+        self.fail_once = set(fail_once)
+        self.cancelled = []
+
+    def start(self, prompt_ids, n):
+        request_ids = []
+        for _ in range(n):
+            self.issued += 1
+            request_ids.append(f"{self.issued}-x")
+        self.live.extend(request_ids)
+        self.peak = max(self.peak, len(self.live))
+        return request_ids
+
+    def busy(self):
+        return bool(self.live)
+
+    def step(self):
+        self.steps += 1
+        return [(self.live.pop(-1 if self.steps % 2 else 0), [104, 105, EOS])]
+
+    def finish(self, request_id, prompt_len, tokens):
+        if request_id in self.fail_once:
+            self.fail_once.discard(request_id)
+            raise ValueError("3 rows for 5 tokens: rows are missing")
+        return Generation(tokens, ["AAAA"])
+
+    def cancel(self, request_ids):
+        self.cancelled.extend(request_ids)
+        self.live = [r for r in self.live if r not in request_ids]
+
+
+def _mine_window(client, generator, window, max_steps, n=2):
+    return mine_window(job=_job(n=n), hotkey="5Hot", client=client, generator=generator,
+                       tokenizer=_Tokenizer(), render=lambda i: f"q{i}", sign=lambda b: "sig",
+                       window=window, max_steps=max_steps, sleep=lambda s: None)
+
+
+def test_the_window_submits_in_cursor_order_and_never_exceeds_its_size():
+    client, generator = _Client(["accepted"] * 6), _WindowGenerator()
+    counts = _mine_window(client, generator, window=3, max_steps=6)
+    assert [b["cursor"] for b in client.submitted] == [0, 1, 2, 3, 4, 5]
+    assert [b["prompt_index"] for b in client.submitted] == [
+        walk_index("math-v1", "5Hot", c, 50) for c in range(6)]
+    assert all(len(b["completions"]) == 2 for b in client.submitted)
+    assert counts == {"accepted": 6}
+    assert generator.peak == 3 * 2, "the window bounds requests in flight, n per prompt"
+    assert not generator.live
+
+
+def test_a_prompt_refused_without_moving_the_ledger_is_generated_again():
+    """The regeneration is not a new step: every lookahead prompt still lands."""
+    client = _Client(["bad_termination"] + ["accepted"] * 3)
+    counts = _mine_window(client, _WindowGenerator(), window=2, max_steps=3, n=1)
+    assert [b["cursor"] for b in client.submitted] == [0, 0, 1, 2]
+    assert counts == {"bad_termination": 1, "accepted": 3}
+
+
+def test_a_failed_generation_is_regenerated_at_its_cursor():
+    client, generator = _Client(["accepted"] * 3), _WindowGenerator(fail_once={"1-x"})
+    counts = _mine_window(client, generator, window=2, max_steps=3, n=1)
+    assert [b["cursor"] for b in client.submitted] == [0, 1, 2]
+    assert counts == {"generation_failed": 1, "accepted": 3}
+    assert generator.peak <= 2
+
+
+def test_a_complete_job_stops_the_window_and_cancels_what_is_generating():
+    client, generator = _Client(["job_complete"]), _WindowGenerator()
+    counts = _mine_window(client, generator, window=3, max_steps=10, n=1)
+    assert counts == {"job_complete": 1} and len(client.submitted) == 1
+    assert not generator.live and generator.cancelled
+
+
+class _RoomGenerator(_WindowGenerator):
+    """KV room for ``budget`` requests, whatever the window allows."""
+
+    def __init__(self, budget):
+        super().__init__()
+        self.budget = budget
+
+    def room(self, prompt_len, n):
+        return len(self.live) + n <= self.budget
+
+
+@pytest.mark.parametrize("budget, n", [(3, 1), (4, 2), (0, 1)])
+def test_room_admits_prompts_beside_the_window(budget, n):
+    """Room caps what generates below the window; with nothing generating a
+    prompt is admitted anyway, since any one request fits the cache."""
+    client, generator = _Client(["accepted"] * 6), _RoomGenerator(budget)
+    counts = _mine_window(client, generator, window=10, max_steps=6, n=n)
+    assert [b["cursor"] for b in client.submitted] == list(range(6))
+    assert counts == {"accepted": 6}
+    assert generator.peak == max(budget, n)
+    assert not generator.live
+
+
+def _store(backlog, cursor, *, index=None, rendered=None):
+    index = walk_index("math-v1", "5Hot", cursor, 50) if index is None else index
+    backlog.save(cursor, index, f"q{index}" if rendered is None else rendered,
+                 [Generation([104, 105, EOS], [f"stored{cursor}"])])
+
+
+def test_a_restart_submits_the_stored_backlog_instead_of_generating_it(tmp_path):
+    backlog = Backlog(tmp_path, "fp")
+    _store(backlog, 1)
+    _store(backlog, 2)
+    client, generator = _Client(["accepted"] * 3), _WindowGenerator()
+    counts = mine_window(job=_job(n=1), hotkey="5Hot", client=client, generator=generator,
+                         tokenizer=_Tokenizer(), render=lambda i: f"q{i}", sign=lambda b: "sig",
+                         window=3, max_steps=1, sleep=lambda s: None, backlog=backlog)
+    assert [b["cursor"] for b in client.submitted] == [0, 1, 2]
+    assert [b["completions"][0]["proofs"] for b in client.submitted[1:]] == [["stored1"], ["stored2"]]
+    assert generator.issued == 1, "only the missing cursor is generated"
+    assert counts == {"accepted": 3}
+    assert not list(tmp_path.iterdir()), "answered prompts leave the backlog"
+
+
+def test_the_backlog_trusts_only_its_own_current_prompts(tmp_path):
+    _store(Backlog(tmp_path, "old"), 3)
+    backlog = Backlog(tmp_path, "fp")
+    _store(backlog, 0)
+    _store(backlog, 1, index=7)
+    _store(backlog, 2, rendered="stale render")
+    (tmp_path / "4.json").write_text("{broken")
+    client = _Client(["accepted"] * 5)
+    client.position = 1
+    mine_window(job=_job(n=1), hotkey="5Hot", client=client, generator=_WindowGenerator(),
+                tokenizer=_Tokenizer(), render=lambda i: f"q{i}", sign=lambda b: "sig",
+                window=2, max_steps=4, sleep=lambda s: None, backlog=backlog)
+    assert [b["cursor"] for b in client.submitted] == [1, 2, 3, 4]
+    assert not any(b["completions"][0]["proofs"][0].startswith("stored") for b in client.submitted)
+    assert not list(tmp_path.iterdir())
+
+
+class _InlineExecutor:
+    """Answers every submission before ``submit`` returns, as the route did
+    when the miner waited for it: step order is then exact."""
+
+    def submit(self, fn, *args, **kwargs):
+        from concurrent.futures import Future
+
+        future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+
+def test_finished_prompts_outlive_a_halt_in_the_backlog(tmp_path):
+    backlog = Backlog(tmp_path, "fp")
+    client = _Client(["miner_banned"])
+    with pytest.raises(CorpusMinerHalted):
+        mine_window(job=_job(n=1), hotkey="5Hot", client=client, generator=_WindowGenerator(),
+                    tokenizer=_Tokenizer(), render=lambda i: f"q{i}", sign=lambda b: "sig",
+                    window=3, max_steps=10, sleep=lambda s: None, backlog=backlog,
+                    submit_executor=_InlineExecutor())
+    # Cursors 2 and 4 finished and waited (4 while cursor 0's answer was taken);
+    # cursor 0 was answered, so it is gone.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["2.json", "4.json"]
+    assert set(Backlog(tmp_path, "fp").load(0)) == {2, 4}
+
+
+def test_generation_goes_on_while_the_route_answers():
+    """A slow answer must not stall the GPU: steps run while it is pending."""
+    import threading
+
+    class _SlowClient(_Client):
+        def __init__(self, answers):
+            super().__init__(answers)
+            self.steps_during = []
+
+        def submit(self, body):
+            before = generator.steps
+            threading.Event().wait(0.2)
+            self.steps_during.append(generator.steps - before)
+            return super().submit(body)
+
+    class _PacedGenerator(_WindowGenerator):
+        def step(self):
+            threading.Event().wait(0.005)
+            return super().step()
+
+    client, generator = _SlowClient(["accepted"] * 6), _PacedGenerator()
+    counts = _mine_window(client, generator, window=3, max_steps=6, n=1)
+    assert [b["cursor"] for b in client.submitted] == list(range(6))
+    assert counts == {"accepted": 6}
+    assert max(client.steps_during) > 0, "the engine kept stepping during a submission"
+
+
+@pytest.mark.parametrize("reason", ["hotkey_not_registered", "miner_banned"])
+def test_a_halting_refusal_stops_the_window(reason):
+    client, generator = _Client([reason]), _WindowGenerator()
+    with pytest.raises(CorpusMinerHalted, match=reason):
+        _mine_window(client, generator, window=3, max_steps=10, n=1)
+    assert not generator.live
+
+
 def _install_fake_vllm(monkeypatch):
     class _FakeSamplingParams:
         def __init__(self, **kwargs):
@@ -382,6 +589,142 @@ def test_the_vllm_generator_sizes_its_context_to_the_job(monkeypatch):
     # vLLM's default of 1,024 concurrent sequences exceeds a hybrid model's
     # Mamba cache on one H100 (320 on Qwen3.8-27B); a step runs only n of them.
     assert generator._llm.kwargs["max_num_seqs"] == MAX_NUM_SEQS
+
+
+@pytest.mark.parametrize("concurrency, n, window", [(6.79, 1, 6), (6.79, 2, 3), (6.79, 4, 1),
+                                                    (0.5, 1, 1), (None, 1, 1), (900.0, 1, 256)])
+def test_the_window_holds_every_request_at_full_length(monkeypatch, concurrency, n, window):
+    """Rounded down from vLLM's own full-length concurrency: past it the
+    scheduler may preempt, and a preempted request's capture is unprovable."""
+    _install_fake_vllm(monkeypatch)
+    sampling = SimpleNamespace(temperature=1.0, top_p=1.0, top_k=0, min_new_tokens=2, max_new_tokens=64)
+    generator = VllmGenerator("/fake/checkpoint", sampling, SimpleNamespace(chunk_tokens=32, topk=8), EOS)
+    generator._llm.llm_engine = SimpleNamespace(vllm_config=SimpleNamespace(
+        cache_config=SimpleNamespace(kv_cache_max_concurrency=concurrency)))
+    assert generator.window(n) == window
+
+
+class _FakeBlockPool:
+    def __init__(self, num_gpu_blocks):
+        self.num_gpu_blocks = num_gpu_blocks
+        self.free = num_gpu_blocks - 1
+
+    def get_num_free_blocks(self):
+        return self.free
+
+
+def _hybrid_kv_generator(monkeypatch, *, num_blocks, reported, **options):
+    """Three full-attention groups of 784-token blocks and one Mamba group of a
+    single block per request, the layout vLLM gives Qwen3.8-27B."""
+    from reliquary.miner.corpus_miner import PROMPT_ALLOWANCE_TOKENS
+
+    class FullAttentionSpec:
+        sliding_window = None
+
+        def __init__(self, block_size):
+            self.block_size = block_size
+
+    class MambaSpec:
+        page_size_bytes = 100
+
+        def max_memory_usage_bytes(self, vllm_config):
+            return 100
+
+    _install_fake_vllm(monkeypatch)
+    interface = ModuleType("vllm.v1.kv_cache_interface")
+    interface.FullAttentionSpec = FullAttentionSpec
+    monkeypatch.setitem(sys.modules, "vllm.v1.kv_cache_interface", interface)
+    inputs = ModuleType("vllm.inputs")
+    inputs.TokensPrompt = dict
+    monkeypatch.setitem(sys.modules, "vllm.inputs", inputs)
+    sampling = SimpleNamespace(temperature=1.0, top_p=1.0, top_k=0, min_new_tokens=2, max_new_tokens=32768)
+    generator = VllmGenerator("/fake/checkpoint", sampling, SimpleNamespace(chunk_tokens=32, topk=8), EOS,
+                              **options)
+    groups = [SimpleNamespace(kv_cache_spec=FullAttentionSpec(784)) for _ in range(3)]
+    groups.append(SimpleNamespace(kv_cache_spec=MambaSpec()))
+    finished = []
+    generator._llm.llm_engine = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=32768 + PROMPT_ALLOWANCE_TOKENS),
+            cache_config=SimpleNamespace(kv_cache_max_concurrency=reported)),
+        engine_core=SimpleNamespace(engine_core=SimpleNamespace(scheduler=SimpleNamespace(
+            kv_cache_config=SimpleNamespace(kv_cache_groups=groups, num_blocks=num_blocks),
+            waiting=[], kv_cache_manager=SimpleNamespace(block_pool=_FakeBlockPool(num_blocks))))),
+        step=lambda: [finished.pop()] if finished else [],
+        abort_request=lambda ids, internal: None,
+    )
+    issued = iter(range(1000))
+    generator._llm.enqueue = lambda prompts, params, use_tqdm: [f"{next(issued)}-ab" for _ in prompts]
+    generator._kv = generator._kv_layout()
+    return generator, finished
+
+
+def test_room_reserves_each_request_at_its_own_full_length(monkeypatch):
+    from reliquary.miner.corpus_miner import MAX_NUM_SEQS
+
+    # 1,225 blocks over 160 per full-length request (3 x 53 + 1): vLLM's 7.66.
+    generator, finished = _hybrid_kv_generator(monkeypatch, num_blocks=1225, reported=7.656)
+    # A 300-token prompt plus 32,768 tokens (and one async step) holds 3 x 43 + 1.
+    assert generator.capacity(300, 1) == 1224 // 130 == 9
+    assert generator.capacity(300, 2) == 4
+    assert generator.window(1) == MAX_NUM_SEQS
+    started = [generator.start([1] * 300, 1) for _ in range(9)]
+    assert not generator.room(300, 1)
+    finished.append(SimpleNamespace(finished=True, request_id=started[0][0].split("-")[0],
+                                    outputs=[SimpleNamespace(token_ids=[EOS])]))
+    assert [r for r, _ in generator.step()] == started[0]
+    assert generator.room(300, 1)
+    generator.start([1] * 300, 1)
+    generator.cancel(started[1])
+    assert generator.room(300, 1) and not generator.room(8000, 2)
+
+
+def test_with_a_headroom_prompts_are_admitted_by_the_blocks_actually_free(monkeypatch):
+    from reliquary.miner.corpus_miner import OVERCOMMIT_MAX_IN_FLIGHT
+
+    generator, _ = _hybrid_kv_generator(monkeypatch, num_blocks=1225, reported=7.656, kv_headroom=0.1)
+    scheduler = generator._llm.llm_engine.engine_core.engine_core.scheduler
+    pool = scheduler.kv_cache_manager.block_pool
+    assert generator.window(1) == OVERCOMMIT_MAX_IN_FLIGHT
+    assert generator.capacity(300, 1) == OVERCOMMIT_MAX_IN_FLIGHT
+    for _ in range(12):  # past the 9 a full-length reservation allows
+        generator.start([1] * 300, 1)
+    # 300 + 4,096 tokens holds 3 x 6 + 1 = 19 blocks; 10% of 1,225 stays spare.
+    pool.free = 123 + 19
+    assert generator.room(300, 1)
+    pool.free = 123 + 18
+    assert not generator.room(300, 1)
+    pool.free = 1000
+    scheduler.waiting.append("preempted or not yet scheduled")
+    assert not generator.room(300, 1)
+
+
+def test_draft_tokens_and_a_headroom_turn_on_positional_capture(monkeypatch):
+    _install_fake_vllm(monkeypatch)
+    sampling = SimpleNamespace(temperature=1.0, top_p=1.0, top_k=0, min_new_tokens=2, max_new_tokens=64)
+    proof = SimpleNamespace(chunk_tokens=32, topk=8)
+    seen = []
+    import reliquary.miner.vllm_hidden_capture as capture_module
+
+    real = capture_module.capture_hidden_states
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(capture_module, "capture_hidden_states", spy)
+    plain = VllmGenerator("/fake/checkpoint", sampling, proof, EOS)
+    drafted = VllmGenerator("/fake/checkpoint", sampling, proof, EOS, speculative_tokens=2)
+    VllmGenerator("/fake/checkpoint", sampling, proof, EOS, kv_headroom=0.1)
+    assert [k["positional"] for k in seen] == [False, True, True]
+    assert "speculative_config" not in plain._llm.kwargs
+    assert drafted._llm.kwargs["speculative_config"] == {"method": "mtp", "num_speculative_tokens": 2}
+
+
+def test_a_misread_kv_layout_falls_back_to_full_length(monkeypatch):
+    generator, _ = _hybrid_kv_generator(monkeypatch, num_blocks=1225, reported=5.0)
+    assert generator._kv is None
+    assert generator.window(1) == 5 and generator.room(300, 1)
 
 
 def test_a_vision_checkpoint_is_served_text_only(monkeypatch, tmp_path):
