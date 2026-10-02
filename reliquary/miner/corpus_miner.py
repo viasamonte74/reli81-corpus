@@ -560,7 +560,8 @@ def mine_window(*, job, hotkey, client, generator, tokenizer, render, sign, wind
                 max_consecutive_failures: int = _MAX_CONSECUTIVE_FAILURES,
                 sign_skip=None, max_lookahead: int = 256,
                 backlog: Backlog | None = None, submit_executor=None,
-                max_prompt_mismatches: int = 3) -> dict[str, int]:
+                max_prompt_mismatches: int = 3,
+                prune_interval: float = 15.0) -> dict[str, int]:
     """Mine like ``mine_steps``, with up to ``window`` prompts generating at once.
 
     The route accepts a hotkey's submission only at its ledger cursor, so the
@@ -572,9 +573,14 @@ def mine_window(*, job, hotkey, client, generator, tokenizer, render, sign, wind
     prompt by its own length, otherwise ``window`` alone must guarantee it
     (``VllmGenerator.window``).
 
-    Full prompts are skipped only when nothing is generating ahead of the
-    ledger cursor. A lookahead prompt that fills meanwhile is refused
-    ``prompt_full``, which moves the ledger past it as a skip would.
+    While the ledger prompt cannot be submitted yet, ``next`` is read again at
+    most every ``prune_interval`` seconds (on the submitter, so generation goes
+    on). A full ledger prompt is skipped together with the run of full prompts
+    after it, and whatever was generating or waiting for that run is dropped
+    rather than finished and refused ``prompt_full``; the run behind an open
+    ledger prompt is dropped too and skipped once the ledger reaches it. A
+    prompt that fills after that read is still refused ``prompt_full``, which
+    moves the ledger past it as a skip would.
 
     With a ``backlog``, every finished prompt is stored until the route answers
     it, and a restart resumes with the stored prompts still ahead of the ledger.
@@ -641,20 +647,35 @@ def mine_window(*, job, hotkey, client, generator, tokenizer, render, sign, wind
         for request_id in slot.request_ids:
             owner.pop(request_id, None)
 
+    # Cursors ``next`` reported full: never generated, skipped once the ledger
+    # reaches them. Every cursor in [ledger, next_cursor) is in ``slots``,
+    # ``redo`` or here, or the ledger could land on one nothing will generate.
+    known_full: set[int] = set()
+
+    def discard(cursor: int) -> None:
+        drop(cursor)
+        if backlog is not None:
+            backlog.discard(cursor)
+
     def resync() -> None:
         nonlocal ledger, next_cursor
         ledger = _retry(lambda: client.cursor(hotkey), **retry_kwargs)
         for cursor in [c for c in slots if c < ledger]:
-            drop(cursor)
-            if backlog is not None:
-                backlog.discard(cursor)
+            discard(cursor)
         for cursor in [c for c in prepared if c < ledger]:
             del prepared[cursor]
+        known_full.difference_update([c for c in known_full if c < ledger])
         if ledger >= next_cursor:
             next_cursor = ledger
-        elif ledger not in slots:
+        elif ledger not in slots and ledger not in known_full:
             # The ledger stayed on a refused prompt: generate it again.
             heapq.heappush(redo, ledger)
+
+    def unlearn_full() -> None:
+        for cursor in known_full:
+            if ledger <= cursor < next_cursor:
+                heapq.heappush(redo, cursor)
+        known_full.clear()
 
     def fill() -> None:
         # max_steps counts new cursors: a prompt generated again is not a new step.
@@ -662,7 +683,7 @@ def mine_window(*, job, hotkey, client, generator, tokenizer, render, sign, wind
         while not complete and generating() < window:
             if redo:
                 cursor = heapq.heappop(redo)
-                if cursor < ledger or cursor in slots:
+                if cursor < ledger or cursor in slots or cursor in known_full:
                     continue
                 if not start(cursor):
                     heapq.heappush(redo, cursor)
@@ -671,7 +692,8 @@ def mine_window(*, job, hotkey, client, generator, tokenizer, render, sign, wind
             if len(slots) >= max_lookahead or (max_steps is not None and started >= max_steps):
                 return
             else:
-                if skipping and next_cursor == ledger and not slots and not submitting:
+                if (skipping and next_cursor == ledger and not slots and not submitting
+                        and not pruning):
                     cursor, skipping = _past_full_prompts(
                         job=job, hotkey=hotkey, client=client, cursor=ledger,
                         sign_skip=sign_skip, counts=counts, retry_kwargs=retry_kwargs,
@@ -680,7 +702,7 @@ def mine_window(*, job, hotkey, client, generator, tokenizer, render, sign, wind
                         complete = True
                         return
                     ledger = next_cursor = cursor
-                while next_cursor in slots:
+                while next_cursor in slots or next_cursor in known_full:
                     next_cursor += 1
                 cursor = next_cursor
             if not start(cursor):
@@ -689,10 +711,113 @@ def mine_window(*, job, hotkey, client, generator, tokenizer, render, sign, wind
             started += 1
 
     submitting: list = []
+    # At most one ``next`` read (and skip) in flight, never beside a submission:
+    # both move the ledger.
+    pruning: list = []
+    last_prune = float("-inf")
 
     def submittable() -> bool:
-        return (not complete and not submitting and ledger in slots
+        return (not complete and not submitting and not pruning and ledger in slots
                 and len(slots[ledger].generations) == n)
+
+    def prune_due() -> bool:
+        if not skipping or complete or submitting or pruning or submittable():
+            return False
+        if ledger in known_full:
+            return True
+        return bool(slots) and time.monotonic() - last_prune >= prune_interval
+
+    def read_and_skip(expected: int):
+        """On the submitter: where the walk stands and, when the ledger prompt
+        is full, the skip over it and the run of full prompts after it."""
+        position = _retry(lambda: client.next_prompt(hotkey), **retry_kwargs)
+        if position is None:
+            return "off", None
+        try:
+            cursor = int(position["cursor"])
+            index = int(position["prompt_index"])
+            remaining = int(position["slots_remaining"])
+            skip_to = int(position["skip_to"])
+        except (KeyError, TypeError, ValueError):
+            return "off", None
+        if skip_to <= cursor:
+            return "off", None
+        if cursor != expected:
+            return "moved", None
+        if index != job_walk_index(job, hotkey, cursor):
+            # Not our walk: nothing it says about later cursors can be trusted.
+            return "open", (cursor, cursor + 1)
+        if remaining > 0:
+            return "open", (cursor, skip_to)
+        body = build_skip(job=job, hotkey=hotkey, cursor=cursor, prompt_index=index,
+                          to_cursor=skip_to, sign=sign_skip)
+        answer = _retry(lambda: client.skip(body), **retry_kwargs)
+        if answer is None:
+            return "off", None
+        return "skip", (cursor, skip_to, answer)
+
+    def start_prune() -> None:
+        nonlocal last_prune
+        last_prune = time.monotonic()
+        pruning.append(submitter.submit(read_and_skip, ledger))
+
+    def forget_full(start: int, stop: int) -> None:
+        """[start, stop) is full: generating or submitting it can only be refused."""
+        known_full.update(range(start, stop))
+        doomed = [c for c in slots if start <= c < stop]
+        for cursor in doomed:
+            discard(cursor)
+        for cursor in [c for c in prepared if start <= c < stop]:
+            del prepared[cursor]
+        if doomed:
+            counts["pruned_full"] += len(doomed)
+            logger.info("cursors %d..%d are full: dropped %d prompt(s) generated for them",
+                        start, stop - 1, len(doomed))
+
+    def pruned() -> None:
+        nonlocal ledger, next_cursor, skipping, complete
+        kind, data = pruning.pop().result()
+        if kind == "off":
+            logger.info("corpus job %s: the validator cannot say which prompts are full; "
+                        "no longer skipping", job.job_id)
+            skipping = False
+            unlearn_full()
+            return
+        if kind == "moved":
+            resync()
+            return
+        if kind == "open":
+            cursor, skip_to = data
+            if cursor in known_full:
+                unlearn_full()
+            forget_full(cursor + 1, skip_to)
+            return
+        cursor, skip_to, answer = data
+        if answer.get("skipped"):
+            counts["skipped"] += 1
+            forget_full(cursor, skip_to)
+            ledger = skip_to
+            known_full.difference_update([c for c in known_full if c < ledger])
+            if ledger >= next_cursor:
+                next_cursor = ledger
+            elif ledger not in slots and ledger not in known_full:
+                heapq.heappush(redo, ledger)
+            logger.info("skipped full cursors %d..%d", cursor, skip_to - 1)
+            return
+        reason = str(answer.get("reason"))
+        counts["job_complete" if reason == "job_complete" else f"skip_{reason}"] += 1
+        if reason == "job_complete":
+            complete = True
+            return
+        if reason in _HALT:
+            raise CorpusMinerHalted(f"the validator refused this hotkey: {reason}",
+                                    counts=dict(counts))
+        if reason not in _SKIP_REREAD:
+            logger.warning("corpus skip refused: %s %s; no longer skipping",
+                           reason, answer.get("detail"))
+            skipping = False
+        unlearn_full()
+        resync()
 
     def submit_head() -> None:
         """Send the ledger prompt; the answer is taken by ``answered``. One at a
@@ -769,8 +894,12 @@ def mine_window(*, job, hotkey, client, generator, tokenizer, render, sign, wind
             fill()
             if submitting and submitting[0][2].done():
                 answered()
+            if pruning and pruning[0].done():
+                pruned()
             if submittable():
                 submit_head()
+            elif prune_due():
+                start_prune()
             if time.monotonic() - heartbeat >= 300:
                 logger.info("%d generating, %d finished waiting on cursor %d, %.1f tokens/s finished",
                             generating(), len(slots) - generating(), ledger,
@@ -784,7 +913,13 @@ def mine_window(*, job, hotkey, client, generator, tokenizer, render, sign, wind
                     if submitting:
                         submitting[0][2].result()
                         continue
+                    if pruning:
+                        pruning[0].result()
+                        continue
                     if submittable():
+                        continue
+                    if prune_due():
+                        start_prune()
                         continue
                     # Nothing is generating or submitting and the head cannot
                     # be submitted: only max_steps can leave the window like this.
