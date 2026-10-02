@@ -1272,6 +1272,11 @@ class VllmGenerator:
             extra["limit_mm_per_prompt"] = {"image": 0, "video": 0}
         if speculative_tokens:
             extra["speculative_config"] = {"method": "mtp", "num_speculative_tokens": speculative_tokens}
+        # vLLM 0.26's bundled FlashAttention was built against CUDA 13; this
+        # host's driver only advertises 12.8, so FLASH_ATTN dies at first use.
+        # FlashInfer (and Triton) ship with the wheel and run on cu128.
+        extra.setdefault("attention_backend", "FLASHINFER")
+        extra.setdefault("mm_encoder_attn_backend", "FLASHINFER")
         self._llm = LLM(model=checkpoint_dir, dtype="bfloat16", enable_prefix_caching=False,
                         seed=seed, **memory, **extra)
         self._sampling_kwargs = dict(

@@ -154,6 +154,22 @@ def _check_engine_mode() -> None:
         raise RuntimeError("hidden-state capture is hooked on the V1 runner: set VLLM_USE_V2_MODEL_RUNNER=0")
 
 
+def _record_step(capture: HiddenStateCapture, runner, scheduled: dict[str, int],
+                 output, *, positions, positional: bool) -> None:
+    """Take the runner's hidden states for this step into ``capture``."""
+    if not scheduled:
+        return
+    hidden = output[0] if isinstance(output, tuple) else output
+    batch = runner.input_batch
+    # The positions the model was given, not the scheduler's: under async
+    # scheduling a step is planned before the last one's draft tokens are
+    # judged, and the runner corrects positions on the GPU.
+    if not positional:
+        positions = None
+    capture.record(batch.req_ids[: batch.num_reqs], dict(scheduled), hidden, positions)
+    scheduled.clear()
+
+
 @contextlib.contextmanager
 def capture_hidden_states(runner_cls=None, *, non_blocking: bool = False,
                           positional: bool = False) -> Iterator[HiddenStateCapture]:
@@ -163,30 +179,54 @@ def capture_hidden_states(runner_cls=None, *, non_blocking: bool = False,
     capture = HiddenStateCapture(non_blocking=non_blocking)
     scheduled: dict[str, int] = {}
     original_execute = runner_cls.execute_model
-    original_forward = runner_cls._model_forward
+    # Newer vLLM (post-0.10) routes the model call through ``_model_forward``;
+    # 0.10 calls ``self.model(...)`` inside ``execute_model`` instead. Hook
+    # whichever path this build has so proofs still get their activations.
+    original_forward = getattr(runner_cls, "_model_forward", None)
+
+    if original_forward is not None:
+        def execute_model(self, scheduler_output, *args, **kwargs):
+            scheduled.clear()
+            scheduled.update(scheduler_output.num_scheduled_tokens)
+            return original_execute(self, scheduler_output, *args, **kwargs)
+
+        def _model_forward(self, *args, **kwargs):
+            output = original_forward(self, *args, **kwargs)
+            positions = kwargs.get("positions", args[1] if len(args) > 1 else None)
+            _record_step(capture, self, scheduled, output, positions=positions,
+                         positional=positional)
+            return output
+
+        runner_cls.execute_model = execute_model
+        runner_cls._model_forward = _model_forward
+        try:
+            yield capture
+        finally:
+            runner_cls.execute_model = original_execute
+            runner_cls._model_forward = original_forward
+        return
 
     def execute_model(self, scheduler_output, *args, **kwargs):
         scheduled.clear()
         scheduled.update(scheduler_output.num_scheduled_tokens)
-        return original_execute(self, scheduler_output, *args, **kwargs)
+        model = self.model
+        original_model_forward = model.forward
 
-    def _model_forward(self, *args, **kwargs):
-        output = original_forward(self, *args, **kwargs)
-        if scheduled:
-            hidden = output[0] if isinstance(output, tuple) else output
-            batch = self.input_batch
-            # The positions the model was given, not the scheduler's: under
-            # async scheduling a step is planned before the last one's draft
-            # tokens are judged, and the runner corrects positions on the GPU.
-            positions = kwargs.get("positions", args[1] if len(args) > 1 else None) if positional else None
-            capture.record(batch.req_ids[: batch.num_reqs], dict(scheduled), hidden, positions)
-            scheduled.clear()
-        return output
+        def model_forward(*margs, **mkwargs):
+            output = original_model_forward(*margs, **mkwargs)
+            positions = mkwargs.get("positions", margs[1] if len(margs) > 1 else None)
+            _record_step(capture, self, scheduled, output, positions=positions,
+                         positional=positional)
+            return output
+
+        model.forward = model_forward
+        try:
+            return original_execute(self, scheduler_output, *args, **kwargs)
+        finally:
+            model.forward = original_model_forward
 
     runner_cls.execute_model = execute_model
-    runner_cls._model_forward = _model_forward
     try:
         yield capture
     finally:
         runner_cls.execute_model = original_execute
-        runner_cls._model_forward = original_forward
